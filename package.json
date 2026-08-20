@@ -6,27 +6,38 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "vinext dev",
+    "dev": "node --env-file-if-exists=.env.local scripts/dev.mjs",
+    "dev:web": "vinext dev",
+    "dev:signal": "node --env-file-if-exists=.env.local server/signaling.mjs",
+    "companion": "node companion/server.mjs",
+    "companion:arm": "node companion/server.mjs --arm",
+    "mutiny:extract": "node scripts/extract-inner-swf.mjs",
+    "mutiny:patch": "node scripts/patch-local-license.mjs",
+    "mutiny:local": "node scripts/mutiny-local.mjs",
+    "start:lan": "node --env-file-if-exists=.env.local scripts/start-lan.mjs",
     "build": "vinext build",
     "start": "vinext start",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs",
-    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "test": "npm run build && node --test tests/rendered-html.test.mjs tests/companion-cdp.test.mjs tests/signaling-turns.test.mjs",
+    "lint": "eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern work --ignore-pattern outputs --ignore-pattern .npm-cache",
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",
     "@eslint/js": "9.39.4",
     "@next/eslint-plugin-next": "16.2.6",
     "@openai/sites-vite-plugin": "0.1.0",
+    "@ruffle-rs/ruffle": "^0.5.0",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "6.0.2",
     "@vitejs/plugin-rsc": "0.5.26",
     "drizzle-kit": "0.31.10",

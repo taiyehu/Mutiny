@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Mutiny · 本地 Ruffle 播放器</title>
+  <style>
+    :root{color-scheme:dark;font-family:Inter,"Microsoft YaHei",sans-serif;background:#111714;color:#f8f3e6}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% 0,#29403a 0,#111714 48%);display:grid;place-items:center;padding:24px}
+    main{width:min(1120px,100%)}header{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:14px}h1{margin:0;font-size:clamp(22px,4vw,38px)}p{margin:5px 0 0;color:#aebbb5;font-size:13px}.tools{display:flex;gap:8px}.tools button{border:1px solid #d8dfd9;background:#f0a44b;color:#17231f;padding:9px 13px;font-weight:800;cursor:pointer}
+    #frame{position:relative;width:100%;aspect-ratio:__GAME_WIDTH__/__GAME_HEIGHT__;background:#000;border:2px solid #d8dfd9;box-shadow:8px 8px 0 #050706;overflow:hidden}ruffle-player{width:100%;height:100%;display:block}.status{margin-top:14px;padding:10px 12px;border:1px solid #44534d;background:#18211e;font:12px ui-monospace,monospace;color:#bac7c1}.warning{color:#efb06a}
+    @media(max-width:640px){body{padding:12px}header{align-items:start;flex-direction:column}.tools{width:100%}.tools button{flex:1}}
+  </style>
+</head>
+<body>
+  <main>
+    <header><div><h1>Mutiny · 本地运行</h1><p>内层 SWF + 本机 Ruffle，不连接公网部署。</p></div><div class="tools"><button id="reload">重新载入</button><button id="fullscreen">全屏</button></div></header>
+    <div id="frame"></div>
+    <div class="status" id="status">正在载入 Ruffle 与游戏…</div>
+    <p class="warning">__LICENSE_NOTE__</p>
+  </main>
+  <script>
+    window.RufflePlayer = window.RufflePlayer || {};
+    window.RufflePlayer.config = { autoplay: "on", unmuteOverlay: "visible", splashScreen: false, contextMenu: "on", allowScriptAccess: false };
+  </script>
+  <script src="/ruffle/ruffle.js"></script>
+  <script>
+    const frame = document.getElementById("frame");
+    const status = document.getElementById("status");
+    let player;
+    async function loadGame() {
+      player?.remove();
+      const ruffle = window.RufflePlayer.newest();
+      player = ruffle.createPlayer();
+      frame.appendChild(player);
+      try {
+        await player.ruffle().load({ url: "/mutiny-game.swf", autoplay: "on", allowScriptAccess: false, letterbox: "on" });
+        status.textContent = "游戏已载入 · __GAME_WIDTH__ × __GAME_HEIGHT__ · __GAME_VARIANT__ · 输入仅作用于此页面";
+      } catch (error) {
+        status.innerHTML = `<span class="warning">载入失败：</span>${String(error)}`;
+      }
+    }
+    document.getElementById("reload").addEventListener("click", loadGame);
+    document.getElementById("fullscreen").addEventListener("click", () => frame.requestFullscreen());
+    window.addEventListener("DOMContentLoaded", loadGame);
+  </script>
+</body>
+</html>

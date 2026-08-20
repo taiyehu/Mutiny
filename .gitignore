@@ -39,3 +39,11 @@ yarn-error.log*
 /.wrangler/
 /outputs/
 /work/
+
+# Local-only copyrighted game files
+/mutiny.swf
+/local-player/mutiny-game.swf
+/local-player/mutiny-game-local.swf
+/.tools/
+/deploy/turn.env
+/.tmp-ssh-turn-deploy/

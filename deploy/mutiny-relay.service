@@ -1,0 +1,27 @@
+[Unit]
+Description=Mutiny Relay LAN service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/eighteen-wang/apps/mutiny-relay
+Environment=NODE_ENV=production
+Environment=PATH=/home/eighteen-wang/.local/node-v22.17.0-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=SIGNAL_HOST=127.0.0.1
+Environment=SIGNAL_PORT=8787
+Environment=WEB_PORT=3000
+Environment=LAN_HOST=0.0.0.0
+Environment=LAN_HTTPS_PORT=3443
+Environment=LAN_TLS_KEY=/home/eighteen-wang/apps/mutiny-relay/tls/server.key
+Environment=LAN_TLS_CERT=/home/eighteen-wang/apps/mutiny-relay/tls/server.crt
+Environment=PUBLIC_HTTP_HOST=127.0.0.1
+Environment=PUBLIC_HTTP_PORT=3080
+EnvironmentFile=-/home/eighteen-wang/apps/mutiny-relay/deploy/turn.env
+ExecStart=/home/eighteen-wang/.local/node-v22.17.0-linux-x64/bin/node scripts/start-lan.mjs
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
