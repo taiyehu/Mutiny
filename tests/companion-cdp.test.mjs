@@ -108,6 +108,17 @@ test("页面助手通过 CDP 按 viewport CSS 像素注入输入", async (t) => 
   assert.equal((await nextMessage("calibration-state")).state, "point-1");
   client.send(JSON.stringify({ type: "pointer-down", x: 0.2, y: 0.3, button: 0, buttons: 1 }));
   assert.equal((await nextMessage("calibration-state")).state, "point-2");
+  client.send(JSON.stringify({ type: "pointer-down", x: 0.25, y: 0.35, button: 0, buttons: 1 }));
+  const tooClose = await nextMessage("calibration-state");
+  assert.equal(tooClose.state, "point-1");
+  assert.match(tooClose.message, /距离太近/);
+  client.send(JSON.stringify({ type: "cancel-calibration" }));
+  assert.equal((await nextMessage("calibration-state")).state, "off");
+  client.send(JSON.stringify({ type: "start-calibration" }));
+  await nextMessage("control-state");
+  assert.equal((await nextMessage("calibration-state")).state, "point-1");
+  client.send(JSON.stringify({ type: "pointer-down", x: 0.2, y: 0.3, button: 0, buttons: 1 }));
+  assert.equal((await nextMessage("calibration-state")).state, "point-2");
   client.send(JSON.stringify({ type: "pointer-down", x: 0.8, y: 0.7, button: 0, buttons: 1 }));
   assert.equal((await nextMessage("calibration-state")).state, "complete");
   client.send(JSON.stringify({ type: "set-control", enabled: true }));

@@ -9,7 +9,7 @@ const turnKeyId = process.env.CLOUDFLARE_TURN_KEY_ID;
 const turnApiToken = process.env.CLOUDFLARE_TURN_API_TOKEN;
 const turnTtlSeconds = Math.min(86_400, Math.max(600, Number(process.env.TURN_TTL_SECONDS || 3600)));
 const controlLeaseMs = Math.min(10 * 60_000, Math.max(30_000, Number(process.env.CONTROL_LEASE_SECONDS || 90) * 1000));
-const turnDurationMs = Math.min(10 * 60_000, Math.max(5_000, Number(process.env.TURN_DURATION_SECONDS || 90) * 1000));
+const turnDurationMs = Math.min(10 * 60_000, Math.max(5_000, Number(process.env.TURN_DURATION_SECONDS || 60) * 1000));
 let turnCache = null;
 
 function urls(value, fallback = []) {
@@ -77,6 +77,10 @@ function controlState(room) {
     ownerName: owner?.name || "房主",
     side: room.controlOwnerPeerId === room.host.peerId ? "blue" : "red",
     phase: room.controlPhase,
+    mode: room.mode,
+    calibrationReady: room.hostCalibrationReady,
+    calibrationStep: room.calibrationStep,
+    calibrationMessage: room.calibrationMessage,
     turnNumber: room.turnNumber,
     turnDeadline: room.turnDeadline,
     leaseUntil: room.controlLeaseUntil,
@@ -100,8 +104,32 @@ function giveControlToHost(room, advanceTurn = room.controlPhase === "playing") 
   }
 }
 
+function resetCalibration(room) {
+  room.controlPhase = "setup";
+  room.calibrationStep = "off";
+  room.calibrationMessage = null;
+  giveControlToHost(room, false);
+  send(room.host.socket, { type: "abort-calibration" });
+}
+
+function resetControlSession(room, { clearCalibrationReady = false, reloadPeers = false, reason = "控制环境已更新，正在重新载入连接" } = {}) {
+  if (room.controlPhase === "calibration") send(room.host.socket, { type: "abort-calibration" });
+  else send(room.host.socket, { type: "reset-page-control" });
+  room.controlPhase = "setup";
+  room.calibrationStep = "off";
+  room.calibrationMessage = null;
+  room.turnNumber = 0;
+  if (clearCalibrationReady) room.hostCalibrationReady = false;
+  giveControlToHost(room, false);
+  if (reloadPeers) {
+    for (const peer of room.peers.values()) {
+      if (peer.approved) send(peer.socket, { type: "reload-session", reason });
+    }
+  }
+}
+
 function passControl(room, client) {
-  if (room.controlPhase !== "playing") return false;
+  if (room.mode !== "turns" || room.controlPhase !== "playing") return false;
   if (room.controlOwnerPeerId !== client.peerId) return false;
   if (client.isHost) {
     const controllers = [...room.peers.values()].filter((peer) => peer.approved && peer.role === "controller");
@@ -155,6 +183,7 @@ wss.on("connection", (socket) => {
       const code = roomCode();
       const room = {
         code,
+        mode: message.mode === "free" ? "free" : "turns",
         host: { socket, peerId: client.peerId, name: String(message.name || "房主").slice(0, 24) },
         peers: new Map(),
         createdAt: Date.now(),
@@ -164,6 +193,9 @@ wss.on("connection", (socket) => {
         controllerCursor: -1,
         turnNumber: 0,
         turnDeadline: null,
+        hostCalibrationReady: false,
+        calibrationStep: "off",
+        calibrationMessage: null,
       };
       rooms.set(code, room);
       client.roomCode = code;
@@ -201,19 +233,75 @@ wss.on("connection", (socket) => {
       return;
     }
 
-    if (message.type === "start-calibration" && client.isHost) {
-      const peer = room.peers.get(message.peerId);
-      if (!peer?.approved || peer.role !== "controller") return send(socket, { type: "error", message: "请先选择一名已批准的红方玩家" });
+    if (message.type === "set-calibration-ready" && client.isHost) {
+      room.hostCalibrationReady = Boolean(message.ready);
+      if (!room.hostCalibrationReady && room.controlPhase === "calibration") {
+        resetCalibration(room);
+      }
+      broadcastRoom(room);
+      return;
+    }
+
+    if (message.type === "reset-control-session" && client.isHost) {
+      resetControlSession(room, { clearCalibrationReady: true, reloadPeers: true, reason: String(message.reason || "房主页面助手已重新连接，正在重新载入控制连接") });
+      broadcastRoom(room);
+      return;
+    }
+
+    if (message.type === "reload-session-ready" && !client.isHost) {
+      const peer = room.peers.get(client.peerId);
+      if (peer?.approved) send(room.host.socket, { type: "restart-peer", peerId: peer.peerId });
+      return;
+    }
+
+    if (message.type === "start-calibration") {
+      const peer = client.isHost ? room.peers.get(message.peerId) : room.peers.get(client.peerId);
+      if (!peer?.approved || peer.role !== "controller") return send(socket, { type: "error", message: "只有已批准的远端操作者可以开始校准" });
+      if (room.controlPhase === "calibration") return send(socket, { type: "error", message: "校准正在进行；请使用重新开始按钮" });
+      if (room.mode === "turns" && room.controlPhase === "playing" && room.controlOwnerPeerId !== peer.peerId) return send(socket, { type: "error", message: "请在你的回合内发起重新校准" });
+      if (!room.hostCalibrationReady) return send(socket, { type: "error", message: "房主尚未连接助手并选定目标页面" });
       room.controlPhase = "calibration";
+      room.calibrationStep = "point-1";
+      room.calibrationMessage = null;
       room.controlOwnerPeerId = peer.peerId;
       room.controlLeaseUntil = Date.now() + controlLeaseMs;
       room.turnDeadline = null;
+      send(room.host.socket, { type: "begin-calibration", peerId: peer.peerId });
+      broadcastRoom(room);
+      return;
+    }
+
+    if (message.type === "restart-calibration" && !client.isHost && room.controlPhase === "calibration") {
+      const peer = room.peers.get(client.peerId);
+      if (!peer?.approved || peer.role !== "controller" || room.controlOwnerPeerId !== client.peerId) return send(socket, { type: "error", message: "你当前不能重试校准" });
+      if (!room.hostCalibrationReady) return send(socket, { type: "error", message: "房主页面助手已断开" });
+      room.calibrationStep = "point-1";
+      room.calibrationMessage = null;
+      room.controlLeaseUntil = Date.now() + controlLeaseMs;
+      send(room.host.socket, { type: "begin-calibration", peerId: peer.peerId });
+      broadcastRoom(room);
+      return;
+    }
+
+    if (message.type === "calibration-progress" && client.isHost && room.controlPhase === "calibration") {
+      if (["point-1", "point-2"].includes(message.state)) room.calibrationStep = message.state;
+      room.calibrationMessage = message.message ? String(message.message).slice(0, 160) : null;
+      broadcastRoom(room);
+      return;
+    }
+
+    if (message.type === "cancel-calibration" && room.controlPhase === "calibration" && (client.isHost || room.controlOwnerPeerId === client.peerId)) {
+      const peer = room.peers.get(message.peerId);
+      if (peer) send(peer.socket, { type: "error", message: String(message.reason || "房主的页面助手尚未准备好") });
+      resetCalibration(room);
       broadcastRoom(room);
       return;
     }
 
     if (message.type === "finish-calibration" && client.isHost && room.controlPhase === "calibration") {
       room.controlPhase = "ready";
+      room.calibrationStep = "complete";
+      room.calibrationMessage = null;
       room.turnNumber = 0;
       giveControlToHost(room, false);
       broadcastRoom(room);
@@ -223,7 +311,7 @@ wss.on("connection", (socket) => {
     if (message.type === "start-game" && client.isHost && room.controlPhase === "ready") {
       room.controlPhase = "playing";
       room.turnNumber = 0;
-      giveControlToHost(room, true);
+      giveControlToHost(room, room.mode === "turns");
       broadcastRoom(room);
       return;
     }
@@ -235,8 +323,8 @@ wss.on("connection", (socket) => {
     }
 
     if (message.type === "reclaim-control" && client.isHost) {
-      if (room.controlPhase === "calibration") room.controlPhase = "setup";
-      if (room.controlOwnerPeerId !== room.host.peerId) giveControlToHost(room, room.controlPhase === "playing");
+      if (room.controlPhase === "calibration") resetCalibration(room);
+      else if (room.controlOwnerPeerId !== room.host.peerId) giveControlToHost(room, room.controlPhase === "playing");
       else room.controlLeaseUntil = Date.now() + controlLeaseMs;
       broadcastRoom(room);
       return;
@@ -272,11 +360,9 @@ wss.on("connection", (socket) => {
       const peer = room.peers.get(message.peerId);
       if (!peer?.approved) return;
       peer.role = message.role === "controller" ? "controller" : "spectator";
-      if (peer.role !== "controller" && room.controlOwnerPeerId === peer.peerId) {
-        if (room.controlPhase === "calibration") room.controlPhase = "setup";
-        giveControlToHost(room, room.controlPhase === "playing");
-      }
+      resetControlSession(room, { reason: "你的房间身份已变更，正在重新载入控制连接" });
       send(peer.socket, { type: "role-changed", role: peer.role });
+      send(peer.socket, { type: "reload-session", reason: "你的房间身份已变更，正在重新载入控制连接" });
       broadcastRoom(room);
       return;
     }
@@ -299,8 +385,8 @@ wss.on("connection", (socket) => {
       peer.socket.close(4004, "kicked");
       room.peers.delete(message.peerId);
       if (room.controlOwnerPeerId === message.peerId) {
-        if (room.controlPhase === "calibration") room.controlPhase = "setup";
-        giveControlToHost(room, room.controlPhase === "playing");
+        if (room.controlPhase === "calibration") resetCalibration(room);
+        else giveControlToHost(room, room.controlPhase === "playing");
       }
       broadcastRoom(room);
     }
@@ -312,8 +398,8 @@ wss.on("connection", (socket) => {
     if (client.isHost) return closeRoom(room);
     if (room.peers.delete(client.peerId)) {
       if (room.controlOwnerPeerId === client.peerId) {
-        if (room.controlPhase === "calibration") room.controlPhase = "setup";
-        giveControlToHost(room, room.controlPhase === "playing");
+        if (room.controlPhase === "calibration") resetCalibration(room);
+        else giveControlToHost(room, room.controlPhase === "playing");
       }
       send(room.host.socket, { type: "peer-left", peerId: client.peerId });
       broadcastRoom(room);
@@ -327,10 +413,10 @@ const cleanup = setInterval(() => {
     if (room.createdAt < cutoff) {
       closeRoom(room, "房间已超时关闭");
     } else if (room.controlOwnerPeerId !== room.host.peerId && room.controlLeaseUntil < Date.now()) {
-      if (room.controlPhase === "calibration") room.controlPhase = "setup";
-      giveControlToHost(room, room.controlPhase === "playing");
+      if (room.controlPhase === "calibration") resetCalibration(room);
+      else giveControlToHost(room, room.controlPhase === "playing");
       broadcastRoom(room);
-    } else if (room.controlPhase === "playing" && room.turnDeadline <= Date.now()) {
+    } else if (room.mode === "turns" && room.controlPhase === "playing" && room.turnDeadline <= Date.now()) {
       if (room.controlOwnerPeerId === room.host.peerId) {
         if (!passControl(room, { peerId: room.host.peerId, isHost: true })) room.turnDeadline = Date.now() + turnDurationMs;
       } else {

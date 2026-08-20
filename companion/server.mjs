@@ -371,6 +371,13 @@ wss.on("connection", (socket) => {
         reply(socket, { type: "calibration-state", state: "point-1" });
         return;
       }
+      if (message.type === "cancel-calibration") {
+        calibration = null;
+        await removeCalibrationPoint();
+        await target?.setLocalInputLocked(armed && remoteTurn);
+        reply(socket, { type: "calibration-state", state: "off" });
+        return;
+      }
       if (["pointer", "pointer-down", "pointer-up", "click", "key", "key-down", "key-up"].includes(message.type)) {
         inputQueue = inputQueue.catch(() => {}).then(async () => {
           if (calibration) await handleCalibration(message, socket);
