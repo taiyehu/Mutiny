@@ -95,6 +95,74 @@ db/、drizzle/        模板预留的数据层，目前原型不使用数据库
 
 本节从一个已经下载到本机的项目目录开始，分别介绍纯本地游戏、单机联机测试、页面输入注入和局域网双机测试。所有命令都应在项目根目录执行。
 
+### 通用远程操控与 Mutiny 播放器
+
+这两部分现在完全独立，可以分别启动和关闭：
+
+- **通用远程操控**：双击 `一键部署远程操控并清理.cmd`；
+- **Mutiny / Flash 播放器**：双击 `启动Flash播放器.cmd`。
+
+通用远程操控脚本会依次：
+
+1. 检查 Node.js；缺失时通过 Windows `winget` 安装 Node.js LTS；
+2. 检查 npm 项目依赖；缺失时自动执行 `npm ci`；
+3. 检查 Chrome、Edge 或 Chromium；全部缺失时通过 `winget` 安装 Microsoft Edge；
+4. 启动专用 Chromium、房主页面和 companion；房主页面为本地地址时还会启动网页与信令服务；
+5. 在按 `Ctrl+C`、关闭启动窗口或启动中途出错后，自动结束本次脚本创建的进程并删除临时浏览器配置。
+
+脚本只回收自己创建的进程。若 `9222`、`8765` 等所需端口已被其他程序占用，它会停止启动并提示先关闭占用者，不会冒险结束未知进程。通用操控脚本不检查、不启动也不关闭 Ruffle 或任何 Flash 游戏。
+
+也可以在已安装 Node.js 22.13 或更高版本的终端运行：
+
+```bash
+npm run control:start
+```
+
+原来的 `npm run lazy:start` 作为兼容别名保留，其行为与 `npm run control:start` 相同。单独启动 Mutiny 播放器可运行：
+
+```bash
+npm run flash:start
+```
+
+`mutiny.swf` 属于游戏文件，必须由你在获得许可后自行放入项目根目录，播放器脚本不会从网络下载它。
+
+另外还保留了较轻量的房主启动器：
+
+- `启动房主环境.cmd`：首次运行时从 `.env.example` 创建 `.env.local`，启动本地网页与信令服务、打开同一个 Chromium 实例，并在终端启动 companion、显示 6 位授权码。
+
+也可以在 Windows、Linux 或 macOS 的终端执行等价命令：
+
+```bash
+npm run host:start
+```
+
+独立 Flash 启动器和轻量房主启动器可以任意顺序运行，后启动者会复用已有的 Chromium，但房主启动器不会主动探测或打开 Flash 页面。完整的通用远程操控脚本使用自己的临时 Chromium 配置，为保证退出时能准确清理，应先启动它，再启动 Flash 播放器。需要控制 Mutiny 时，从 companion 的目标列表中明确选择 Flash 页面。按 `Ctrl+C` 停止对应脚本创建的服务。
+
+只检查环境、不启动任何服务：
+
+```bash
+npm run flash:check
+npm run host:check
+```
+
+房主启动器默认使用本地页面。如果要使用已经部署的公网服务器，编辑 `.env.local`：
+
+```dotenv
+HOST_RELAY_URL=https://你的公网域名和端口/
+HOST_START_DEV=false
+```
+
+其他可选配置：
+
+```dotenv
+HOST_PLAYER_URL=http://127.0.0.1:8790/
+HOST_CDP_PORT=9222
+HOST_COMPANION_PORT=8765
+HOST_BROWSER_PATH=C:\Program Files\Google\Chrome\Application\chrome.exe
+```
+
+`HOST_BROWSER_PATH` 留空时会依次查找 Chrome、Edge 和 Chromium。浏览器使用独立的临时配置目录，CDP 与 companion 始终只监听 `127.0.0.1`。启动器只会在 `.env.local` 不存在时创建它，不会覆盖已有 TURN 密钥或其他配置。
+
 ### 1. 选择运行方式
 
 | 目标 | 需要启动的服务 | 默认地址 |
@@ -585,4 +653,3 @@ sudo loginctl enable-linger eighteen-wang
 - Vite 8
 - WebRTC
 - Cloudflare Workers / OpenAI Sites
-

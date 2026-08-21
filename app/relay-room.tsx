@@ -1,7 +1,8 @@
 "use client";
 
+/* eslint-disable @next/next/no-html-link-for-pages -- vinext 1.0 beta 的 Link 在生产环境会触发 RSC 预取异常。 */
+
 import { useCallback, useEffect, useRef, useState } from "react";
-import Link from "next/link";
 
 type AppRole = "host" | "guest" | null;
 type PeerRole = "controller" | "spectator";
@@ -607,7 +608,7 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
   return <main className="shell">
     <nav className="topbar">
       <div className="brand"><span className="brandMark">M</span><span>Mutiny Relay</span></div>
-      <Link className="prototypeTag" href="/">← 模式选择</Link>
+      <a className="prototypeTag" href="/">← 模式选择</a>
     </nav>
 
     {!role && <>

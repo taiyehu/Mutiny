@@ -27,7 +27,8 @@ test("服务端能够渲染 Mutiny Relay 首页", async () => {
 });
 
 test("本地联机组件与配置齐全", async () => {
-  const [home, page, freeRoute, turnsRoute, signal, companion, proxy, envExample, packageJson] = await Promise.all([
+  const [layout, home, page, freeRoute, turnsRoute, signal, companion, proxy, hostLauncher, flashLauncher, lazyLauncher, watchdog, envExample, packageJson] = await Promise.all([
+    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/relay-room.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/free/page.tsx", import.meta.url), "utf8"),
@@ -35,9 +36,16 @@ test("本地联机组件与配置齐全", async () => {
     readFile(new URL("../server/signaling.mjs", import.meta.url), "utf8"),
     readFile(new URL("../companion/server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../server/lan-proxy.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/start-host.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/start-flash.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/start-everything.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/cleanup-watchdog.mjs", import.meta.url), "utf8"),
     readFile(new URL("../.env.example", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
+  assert.doesNotMatch(layout, /next\/font/);
+  assert.doesNotMatch(home, /next\/link/);
+  assert.doesNotMatch(page, /next\/link/);
   assert.match(home, /href="\/free"/);
   assert.match(home, /href="\/turns"/);
   assert.match(freeRoute, /mode="free"/);
@@ -61,6 +69,17 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(companion, /Input\.dispatchMouseEvent/);
   assert.match(companion, /Input\.dispatchKeyEvent/);
   assert.match(proxy, /PUBLIC_HTTP_PORT/);
+  assert.match(hostLauncher, /ensureBrowser/);
+  assert.match(hostLauncher, /companion\/server\.mjs/);
+  assert.match(hostLauncher, /scripts\/dev\.mjs/);
+  assert.doesNotMatch(hostLauncher, /playerUrl|8790|Flash/);
+  assert.match(flashLauncher, /scripts\/mutiny-local\.mjs/);
+  assert.match(lazyLauncher, /cleanup-watchdog\.mjs/);
+  assert.match(lazyLauncher, /Browser\.close/);
+  assert.match(lazyLauncher, /findOrInstallBrowser/);
+  assert.doesNotMatch(lazyLauncher, /mutiny-local\.mjs|mutiny\.swf|playerUrl/);
+  assert.match(watchdog, /terminateTree/);
+  assert.match(watchdog, /Browser\.close/);
   assert.match(page, /window\.location\.port === "3000"/);
   assert.match(page, /ws:\/\/127\.0\.0\.1:8787/);
   assert.match(page, /选择目标标签页/);
@@ -80,6 +99,11 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(envExample, /NEXT_PUBLIC_TURN_URLS/);
   assert.match(packageJson, /server\/signaling\.mjs/);
   assert.match(packageJson, /"companion:arm": "node companion\/server\.mjs --arm"/);
+  assert.match(packageJson, /"host:start"/);
+  assert.match(packageJson, /"flash:start"/);
+  assert.match(packageJson, /"lazy:start"/);
+  assert.match(packageJson, /"control:start"/);
+  await access(new URL("../%E4%B8%80%E9%94%AE%E9%83%A8%E7%BD%B2%E8%BF%9C%E7%A8%8B%E6%93%8D%E6%8E%A7%E5%B9%B6%E6%B8%85%E7%90%86.cmd", import.meta.url));
   await assert.rejects(access(new URL("../companion/windows-input.ps1", import.meta.url)));
   await assert.rejects(access(new URL("app/_sites-preview/SkeletonPreview.tsx", root)));
 });
