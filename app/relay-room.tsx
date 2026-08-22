@@ -3,6 +3,7 @@
 /* eslint-disable @next/next/no-html-link-for-pages -- vinext 1.0 beta 的 Link 在生产环境会触发 RSC 预取异常。 */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import Keyboard from "react-simple-keyboard";
 
 type AppRole = "host" | "guest" | null;
@@ -37,14 +38,31 @@ const virtualKeyboardLayout = {
 
 const namedVirtualKeys: Record<string, VirtualKey> = {
   "{bksp}": { key: "Backspace", code: "Backspace", keyCode: 8 },
+  "{tab}": { key: "Tab", code: "Tab", keyCode: 9 },
   "{enter}": { key: "Enter", code: "Enter", keyCode: 13 },
+  "{ctrl}": { key: "Control", code: "ControlLeft", keyCode: 17 },
+  "{alt}": { key: "Alt", code: "AltLeft", keyCode: 18 },
   "{esc}": { key: "Escape", code: "Escape", keyCode: 27 },
   "{space}": { key: " ", code: "Space", keyCode: 32 },
+  "{shiftkey}": { key: "Shift", code: "ShiftLeft", keyCode: 16 },
   "{arrowleft}": { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
   "{arrowup}": { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
   "{arrowright}": { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
   "{arrowdown}": { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
 };
+
+const customVirtualKeyOptions = [
+  ..."qwertyuiopasdfghjklzxcvbnm".split("").map((button) => ({ button, label: button.toUpperCase() })),
+  ..."1234567890".split("").map((button) => ({ button, label: button })),
+  { button: "{tab}", label: "TAB" },
+  { button: "{shiftkey}", label: "SHIFT" },
+  { button: "{ctrl}", label: "CTRL" },
+  { button: "{alt}", label: "ALT" },
+  { button: "{bksp}", label: "⌫" },
+];
+
+const customVirtualKeyLabels = Object.fromEntries(customVirtualKeyOptions.map(({ button, label }) => [button, label]));
+const customVirtualKeysStorageKey = "mutiny.mobile-control-keys.v1";
 
 const punctuationKeys: Record<string, { code: string; keyCode: number }> = {
   ";": { code: "Semicolon", keyCode: 186 }, "=": { code: "Equal", keyCode: 187 },
@@ -165,6 +183,9 @@ export default function RelayRoom() {
   const [control, setControl] = useState<ControlState | null>(null);
   const [isChangingShare, setIsChangingShare] = useState(false);
   const [keyboardLayoutName, setKeyboardLayoutName] = useState<"default" | "shift">("default");
+  const [mobileKeyboardOpen, setMobileKeyboardOpen] = useState(false);
+  const [mobileKeyEditorOpen, setMobileKeyEditorOpen] = useState(false);
+  const [customVirtualKeys, setCustomVirtualKeys] = useState<string[]>([]);
 
   const roleRef = useRef<AppRole>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -189,6 +210,23 @@ export default function RelayRoom() {
   const companionAttemptRef = useRef(0);
   const companionConnectedOnceRef = useRef(false);
   const pressedVirtualKeysRef = useRef(new Map<string, VirtualKey>());
+
+  useEffect(() => {
+    let restoreTimer: number | undefined;
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(customVirtualKeysStorageKey) || "[]");
+      if (Array.isArray(saved)) {
+        const available = new Set(customVirtualKeyOptions.map(({ button }) => button));
+        const keys = saved.filter((button): button is string => typeof button === "string" && available.has(button)).slice(0, 12);
+        restoreTimer = window.setTimeout(() => setCustomVirtualKeys(keys), 0);
+      }
+    } catch {
+      window.localStorage.removeItem(customVirtualKeysStorageKey);
+    }
+    return () => {
+      if (restoreTimer !== undefined) window.clearTimeout(restoreTimer);
+    };
+  }, []);
 
   useEffect(() => { roleRef.current = role; }, [role]);
   useEffect(() => { selfPeerIdRef.current = selfPeerId; }, [selfPeerId]);
@@ -737,6 +775,43 @@ export default function RelayRoom() {
     }
   };
 
+  const pressVirtualButton = (event: ReactPointerEvent<HTMLButtonElement>, button: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pressVirtualKey(button);
+  };
+
+  const releaseVirtualButton = (event: ReactPointerEvent<HTMLButtonElement>, button: string) => {
+    event.preventDefault();
+    event.stopPropagation();
+    releaseVirtualKey(button);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
+  const toggleCustomVirtualKey = (button: string) => {
+    setCustomVirtualKeys((current) => {
+      const selected = current.includes(button);
+      const next = selected ? current.filter((entry) => entry !== button) : current.length < 12 ? [...current, button] : current;
+      window.localStorage.setItem(customVirtualKeysStorageKey, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const toggleVideoFullscreen = async () => {
+    const viewport = videoViewportRef.current;
+    if (!viewport) return;
+    try {
+      if (document.fullscreenElement === viewport) {
+        await document.exitFullscreen();
+      } else {
+        await viewport.requestFullscreen();
+      }
+    } catch {
+      setNotice("当前浏览器不支持页面控制层全屏，请保持横屏使用悬浮按键。");
+    }
+  };
+
   const sendRemoteText = (text: string) => {
     if (text) sendControl({ type: "text", text });
   };
@@ -845,7 +920,7 @@ export default function RelayRoom() {
       <div className="grid">
         <div>
           <div className="stage videoStage">
-            <div className="stageHeader"><span><i className={connected ? "live" : ""} /> {connected ? "实时画面" : "等待连接"}</span>{role === "guest" ? <div className="viewerTools"><button aria-label="缩小" disabled={zoom <= 1} onClick={() => setZoom((value) => Math.max(1, value - 0.25))}>−</button><b>{Math.round(zoom * 100)}%</b><button aria-label="放大" disabled={zoom >= 2.5} onClick={() => setZoom((value) => Math.min(2.5, value + 0.25))}>＋</button><button onClick={() => void videoViewportRef.current?.requestFullscreen()}>全屏</button></div> : <div className="hostShareTools"><span>正在向 {connectedPeers} 人分享</span><button disabled={isChangingShare} onClick={changeSharedWindow}>{isChangingShare ? "等待选择…" : "更换共享窗口"}</button></div>}</div>
+            <div className="stageHeader"><span><i className={connected ? "live" : ""} /> {connected ? "实时画面" : "等待连接"}</span>{role === "guest" ? <div className="viewerTools"><button aria-label="缩小" disabled={zoom <= 1} onClick={() => setZoom((value) => Math.max(1, value - 0.25))}>−</button><b>{Math.round(zoom * 100)}%</b><button aria-label="放大" disabled={zoom >= 2.5} onClick={() => setZoom((value) => Math.min(2.5, value + 0.25))}>＋</button><button onClick={() => void toggleVideoFullscreen()}>全屏</button></div> : <div className="hostShareTools"><span>正在向 {connectedPeers} 人分享</span><button disabled={isChangingShare} onClick={changeSharedWindow}>{isChangingShare ? "等待选择…" : "更换共享窗口"}</button></div>}</div>
             <div className="videoViewport" ref={videoViewportRef}>
               {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex -- 这是接收完整鼠标与键盘输入的远程应用画布。 */}
               <div className={`videoWrap ${role === "guest" ? canGuestControl ? "controlActive" : "controlLocked" : ""}`} role="application" aria-label={role === "guest" ? canGuestControl ? "远程控制画面" : "只读实时画面" : "房主共享画面"} style={{ aspectRatio: videoAspect, width: role === "guest" ? `${zoom * 100}%` : "100%" }} tabIndex={canGuestControl ? 0 : -1}
@@ -862,33 +937,64 @@ export default function RelayRoom() {
                 {role === "host" && remotePointer.visible && <div className={`remoteCursor ${remotePointer.click ? "clicking" : ""}`} style={{ left: `${remotePointer.x * 100}%`, top: `${remotePointer.y * 100}%` }}><span>远程</span></div>}
                 {role === "guest" && !connected && <div className="videoPlaceholder"><div className="radar"><span>◎</span></div><strong>{status}</strong><small>连接建立后画面会自动出现</small></div>}
               </div>
+              {role === "guest" && <div className={`mobileControlOverlay ${canGuestControl ? "" : "disabled"} ${mobileKeyboardOpen || mobileKeyEditorOpen ? "panelOpen" : ""}`} aria-label="悬浮触屏控制">
+                <div className="mobileControlToolbar">
+                  <button type="button" aria-expanded={mobileKeyboardOpen} onClick={() => { setMobileKeyboardOpen((open) => !open); setMobileKeyEditorOpen(false); }}>⌨ 键盘</button>
+                  <button type="button" aria-expanded={mobileKeyEditorOpen} onClick={() => { setMobileKeyEditorOpen((open) => !open); setMobileKeyboardOpen(false); }}>⚙ 按键</button>
+                </div>
+                <div className="mobileQuickControls">
+                  <div className="mobileDpad" aria-label="方向键">
+                    <button type="button" className="dpadUp" aria-label="方向上" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{arrowup}")} onPointerUp={(event) => releaseVirtualButton(event, "{arrowup}")} onPointerCancel={(event) => releaseVirtualButton(event, "{arrowup}")}>↑</button>
+                    <button type="button" className="dpadLeft" aria-label="方向左" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{arrowleft}")} onPointerUp={(event) => releaseVirtualButton(event, "{arrowleft}")} onPointerCancel={(event) => releaseVirtualButton(event, "{arrowleft}")}>←</button>
+                    <span aria-hidden="true" />
+                    <button type="button" className="dpadRight" aria-label="方向右" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{arrowright}")} onPointerUp={(event) => releaseVirtualButton(event, "{arrowright}")} onPointerCancel={(event) => releaseVirtualButton(event, "{arrowright}")}>→</button>
+                    <button type="button" className="dpadDown" aria-label="方向下" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{arrowdown}")} onPointerUp={(event) => releaseVirtualButton(event, "{arrowdown}")} onPointerCancel={(event) => releaseVirtualButton(event, "{arrowdown}")}>↓</button>
+                  </div>
+                  <div className="mobileActionCluster">
+                    {customVirtualKeys.length > 0 && <div className="mobileCustomKeys">{customVirtualKeys.map((button) => <button type="button" key={button} disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, button)} onPointerUp={(event) => releaseVirtualButton(event, button)} onPointerCancel={(event) => releaseVirtualButton(event, button)}>{customVirtualKeyLabels[button]}</button>)}</div>}
+                    <div className="mobileDefaultActions">
+                      <button type="button" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{esc}")} onPointerUp={(event) => releaseVirtualButton(event, "{esc}")} onPointerCancel={(event) => releaseVirtualButton(event, "{esc}")}>ESC</button>
+                      <button type="button" className="mobileSpaceButton" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{space}")} onPointerUp={(event) => releaseVirtualButton(event, "{space}")} onPointerCancel={(event) => releaseVirtualButton(event, "{space}")}>SPACE</button>
+                      <button type="button" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{enter}")} onPointerUp={(event) => releaseVirtualButton(event, "{enter}")} onPointerCancel={(event) => releaseVirtualButton(event, "{enter}")}>ENTER</button>
+                    </div>
+                  </div>
+                </div>
+                {mobileKeyboardOpen && <div className="mobileControlPanel mobileKeyboardPanel">
+                  <div className="mobileKeyboardHeader"><strong>完整键盘</strong><button type="button" aria-label="关闭完整键盘" onClick={() => setMobileKeyboardOpen(false)}>×</button></div>
+                  <Keyboard
+                    layout={virtualKeyboardLayout}
+                    layoutName={keyboardLayoutName}
+                    onKeyPress={pressVirtualKey}
+                    onKeyReleased={releaseVirtualKey}
+                    disableButtonHold
+                    preventMouseDownDefault
+                    stopMouseDownPropagation
+                    stopMouseUpPropagation
+                    theme="hg-theme-default mutinyKeyboard"
+                    display={{
+                      "{bksp}": "⌫", "{enter}": "ENTER", "{shift}": "SHIFT", "{esc}": "ESC",
+                      "{arrowleft}": "←", "{arrowup}": "↑", "{arrowdown}": "↓", "{arrowright}": "→", "{space}": "SPACE",
+                    }}
+                    buttonTheme={[
+                      { class: "remoteDirectionKey", buttons: "{arrowleft} {arrowup} {arrowdown} {arrowright}" },
+                      { class: "remoteActionKey", buttons: "{esc} {enter} {space}" },
+                      { class: "remoteSpaceKey", buttons: "{space}" },
+                    ]}
+                  />
+                  <input aria-label="使用系统键盘发送文字到远端应用" disabled={!canGuestControl} inputMode="text" enterKeyHint="done" placeholder="点此使用手机系统键盘输入文字" onInput={(event) => { const inputEvent = event.nativeEvent as InputEvent; if (inputEvent.isComposing) return; sendRemoteText(event.currentTarget.value); event.currentTarget.value = ""; }} />
+                </div>}
+                {mobileKeyEditorOpen && <div className="mobileControlPanel mobileKeyEditor">
+                  <div className="mobileKeyboardHeader"><strong>自定义悬浮按键</strong><button type="button" aria-label="关闭按键编辑器" onClick={() => setMobileKeyEditorOpen(false)}>×</button></div>
+                  <p>选择最多 12 个游戏按键；方向键、Enter、Esc 和 Space 会始终显示。</p>
+                  <div className="mobileKeyPicker">{customVirtualKeyOptions.map(({ button, label }) => {
+                    const selected = customVirtualKeys.includes(button);
+                    return <button type="button" key={button} className={selected ? "selected" : ""} aria-pressed={selected} disabled={!selected && customVirtualKeys.length >= 12} onClick={() => toggleCustomVirtualKey(button)}>{label}</button>;
+                  })}</div>
+                </div>}
+              </div>}
             </div>
           </div>
           <div className="commandLog"><span>最近操作</span><strong>{lastCommand}</strong></div>
-          {role === "guest" && <div className={`mobileControls ${canGuestControl ? "" : "disabled"}`} aria-label="触屏模拟键盘">
-            <div className="mobileKeyboardHeader"><strong>模拟键盘</strong><span>按住方向键或动作键可连续操作</span></div>
-            <Keyboard
-              layout={virtualKeyboardLayout}
-              layoutName={keyboardLayoutName}
-              onKeyPress={pressVirtualKey}
-              onKeyReleased={releaseVirtualKey}
-              disableButtonHold
-              preventMouseDownDefault
-              stopMouseDownPropagation
-              stopMouseUpPropagation
-              theme="hg-theme-default mutinyKeyboard"
-              display={{
-                "{bksp}": "⌫", "{enter}": "ENTER", "{shift}": "SHIFT", "{esc}": "ESC",
-                "{arrowleft}": "←", "{arrowup}": "↑", "{arrowdown}": "↓", "{arrowright}": "→", "{space}": "SPACE",
-              }}
-              buttonTheme={[
-                { class: "remoteDirectionKey", buttons: "{arrowleft} {arrowup} {arrowdown} {arrowright}" },
-                { class: "remoteActionKey", buttons: "{esc} {enter} {space}" },
-                { class: "remoteSpaceKey", buttons: "{space}" },
-              ]}
-            />
-            <input aria-label="使用系统键盘发送文字到远端应用" disabled={!canGuestControl} inputMode="text" enterKeyHint="done" placeholder="也可点此使用手机系统键盘输入文字" onInput={(event) => { const inputEvent = event.nativeEvent as InputEvent; if (inputEvent.isComposing) return; sendRemoteText(event.currentTarget.value); event.currentTarget.value = ""; }} />
-          </div>}
         </div>
 
         <aside className="panel roomPanel">

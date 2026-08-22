@@ -27,10 +27,11 @@ test("服务端能够渲染 Mutiny Relay 首页", async () => {
 });
 
 test("本地联机组件与配置齐全", async () => {
-  const [layout, home, page, freeRoute, signal, companion, nativeHost, proxy, hostLauncher, flashLauncher, lazyLauncher, watchdog, envExample, packageJson, hostCommand, localTestCommand, flashCommand] = await Promise.all([
+  const [layout, home, page, styles, freeRoute, signal, companion, nativeHost, proxy, hostLauncher, flashLauncher, lazyLauncher, watchdog, envExample, packageJson, hostCommand, localTestCommand, flashCommand] = await Promise.all([
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/relay-room.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../app/free/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../server/signaling.mjs", import.meta.url), "utf8"),
     readFile(new URL("../companion/server.mjs", import.meta.url), "utf8"),
@@ -94,7 +95,16 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(page, /ws:\/\/127\.0\.0\.1:8787/);
   assert.match(page, /选择控制目标/);
   assert.match(page, /Windows 应用窗口/);
-  assert.match(page, /mobileControls/);
+  assert.match(page, /mobileControlOverlay/);
+  assert.match(page, /mobileDefaultActions/);
+  assert.match(page, /自定义悬浮按键/);
+  assert.match(page, /customVirtualKeysStorageKey/);
+  assert.match(page, /document\.fullscreenElement/);
+  assert.match(page, /onPointerCancel/);
+  assert.ok(page.indexOf('className="videoViewport"') < page.indexOf("mobileControlOverlay"));
+  assert.ok(page.indexOf("mobileControlOverlay") < page.indexOf('className="commandLog"'));
+  assert.match(styles, /\.videoViewport:fullscreen/);
+  assert.match(styles, /\.mobileControlOverlay/);
   assert.match(page, /react-simple-keyboard/);
   assert.match(page, /onKeyReleased/);
   assert.match(page, /TURN 已就绪/);
