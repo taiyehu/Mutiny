@@ -47,3 +47,14 @@ yarn-error.log*
 /.tools/
 /deploy/turn.env
 /.tmp-ssh-turn-deploy/
+
+# local deployment artifacts and credentials
+/.deploy-cache/
+/.tmp-ssh-*/
+/.ssh/
+/tls/
+
+# local scratch directories
+/.tmp/
+/tmp/
+/temp/

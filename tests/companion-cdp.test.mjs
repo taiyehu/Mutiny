@@ -89,15 +89,25 @@ test("页面助手通过 CDP 按 viewport CSS 像素注入输入", async (t) => 
   });
 
   const codeMatch = await waitForOutput(companion.stdout, /本次授权码：(\d{6})/);
+  const legacyClient = new WebSocket(`ws://127.0.0.1:${companionPort}`);
+  await new Promise((resolve, reject) => { legacyClient.once("open", resolve); legacyClient.once("error", reject); });
+  const legacyMessage = inbox(legacyClient);
+  legacyClient.send(JSON.stringify({ type: "auth", code: codeMatch[1] }));
+  assert.equal((await legacyMessage("auth-ok")).protocol, "cdp-page-v5");
+  legacyClient.close();
+
   const client = new WebSocket(`ws://127.0.0.1:${companionPort}`);
   await new Promise((resolve, reject) => { client.once("open", resolve); client.once("error", reject); });
   t.after(() => client.close());
   const nextMessage = inbox(client);
 
-  client.send(JSON.stringify({ type: "auth", code: codeMatch[1] }));
-  assert.equal((await nextMessage("auth-ok")).protocol, "cdp-page-v5");
+  client.send(JSON.stringify({ type: "auth", code: codeMatch[1], protocols: ["mutiny-input-v6", "cdp-page-v5"] }));
+  const authenticated = await nextMessage("auth-ok");
+  assert.equal(authenticated.protocol, "mutiny-input-v6");
+  assert.equal(authenticated.capabilities.browser, true);
   const targets = await nextMessage("targets");
   assert.equal(targets.targets[0].id, "test-target");
+  assert.equal(targets.availability.nativeWindows, process.platform === "win32");
   client.send(JSON.stringify({ type: "select-target", targetId: "test-target" }));
   await nextMessage("target-selected");
   client.send(JSON.stringify({ type: "pointer", x: 0.9, y: 0.9 }));
@@ -123,6 +133,7 @@ test("页面助手通过 CDP 按 viewport CSS 像素注入输入", async (t) => 
   assert.equal((await nextMessage("calibration-state")).state, "complete");
   client.send(JSON.stringify({ type: "set-control", enabled: true }));
   assert.equal((await nextMessage("control-state")).enabled, true);
+  assert.equal(commands.filter((command) => command.method === "Page.bringToFront").length, 3);
   client.send(JSON.stringify({ type: "set-turn", remote: true }));
   const turnState = await nextMessage("turn-state");
   assert.equal(turnState.remote, true);

@@ -8,10 +8,10 @@ type AppRole = "host" | "guest" | null;
 type PeerRole = "controller" | "spectator";
 type Peer = { peerId: string; name: string; role: PeerRole; approved: boolean };
 type RemoteEvent = { type: "pointer" | "pointer-down" | "pointer-up" | "click" | "key" | "key-down" | "key-up"; x?: number; y?: number; button?: number; buttons?: number; key?: string; code?: string; repeat?: boolean; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean };
-type BrowserTarget = { id: string; title: string; url: string };
+type ControlTarget = { id: string; title: string; url: string; kind: "browser" | "window"; width?: number; height?: number };
 type Quality = { rtt: number | null; bitrate: number; fps: number | null; lost: number };
 type IceServerMessage = { type: "ice-servers"; iceServers: RTCIceServer[]; turnEnabled: boolean; error?: string | null };
-type ControlState = { ownerPeerId: string; ownerName: string; side: "blue" | "red"; mode: "free" | "turns"; calibrationReady: boolean; calibrationStep: "off" | "point-1" | "point-2" | "complete"; calibrationMessage: string | null; phase: "setup" | "calibration" | "ready" | "playing"; turnNumber: number; turnDeadline: number | null; leaseUntil: number };
+type ControlState = { ownerPeerId: string; ownerName: string; mode: "free"; calibrationReady: boolean; calibrationStep: "off" | "point-1" | "point-2" | "complete"; calibrationMessage: string | null; phase: "setup" | "calibration" | "ready" | "playing"; leaseUntil: number };
 
 const configuredSignalUrl = process.env.NEXT_PUBLIC_SIGNAL_URL;
 
@@ -44,7 +44,39 @@ function defaultRtcConfig(): RTCConfiguration {
   return { iceServers };
 }
 
-export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
+async function preferSmoothVideo(sender: RTCRtpSender) {
+  const parameters = sender.getParameters();
+  if (!parameters.encodings.length) parameters.encodings = [{}];
+  parameters.encodings[0].maxFramerate = 30;
+  (parameters as RTCRtpSendParameters & { degradationPreference?: "maintain-framerate" }).degradationPreference = "maintain-framerate";
+  try {
+    await sender.setParameters(parameters);
+  } catch (error) {
+    console.warn("无法启用帧率优先编码，将继续使用浏览器默认设置。", error);
+  }
+}
+
+async function selectDisplayStream() {
+  const stream = await navigator.mediaDevices.getDisplayMedia({
+    video: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 1920 }, displaySurface: "window" },
+    audio: true,
+  });
+  const videoTrack = stream.getVideoTracks()[0];
+  if (!videoTrack) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw new Error("没有获得可共享的视频轨道");
+  }
+  try {
+    videoTrack.contentHint = "motion";
+    await videoTrack.applyConstraints({ frameRate: { ideal: 30, max: 30 } });
+    return stream;
+  } catch (error) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw error;
+  }
+}
+
+export default function RelayRoom() {
   const [role, setRole] = useState<AppRole>(null);
   const [peerRole, setPeerRole] = useState<PeerRole>("controller");
   const [requestedRole, setRequestedRole] = useState<PeerRole>("controller");
@@ -61,7 +93,7 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
   const [companionCode, setCompanionCode] = useState("");
   const [companionState, setCompanionState] = useState<"off" | "connecting" | "ready">("off");
   const [desktopControlEnabled, setDesktopControlEnabled] = useState(false);
-  const [browserTargets, setBrowserTargets] = useState<BrowserTarget[]>([]);
+  const [browserTargets, setBrowserTargets] = useState<ControlTarget[]>([]);
   const [browserTargetId, setBrowserTargetId] = useState("");
   const [browserTargetReady, setBrowserTargetReady] = useState(false);
   const [browserViewport, setBrowserViewport] = useState<{ width: number; height: number } | null>(null);
@@ -72,7 +104,7 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
   const [mediaPath, setMediaPath] = useState("等待连接");
   const [selfPeerId, setSelfPeerId] = useState("");
   const [control, setControl] = useState<ControlState | null>(null);
-  const [turnSecondsLeft, setTurnSecondsLeft] = useState<number | null>(null);
+  const [isChangingShare, setIsChangingShare] = useState(false);
 
   const roleRef = useRef<AppRole>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -172,8 +204,11 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
     if (pcsRef.current.has(peerId) || !streamRef.current) return;
     const pc = new RTCPeerConnection(rtcConfigRef.current);
     bindPeer(peerId, pc);
-    streamRef.current.getTracks().forEach((track) => pc.addTrack(track, streamRef.current!));
-    const channel = pc.createDataChannel("controls", { ordered: false, maxRetransmits: 0 });
+    const senders = streamRef.current.getTracks().map((track) => pc.addTrack(track, streamRef.current!));
+    await Promise.all(senders.filter((sender) => sender.track?.kind === "video").map(preferSmoothVideo));
+    // Keyboard and mouse button transitions must arrive in order. Losing a key-up
+    // leaves games thinking the key is held and makes later presses appear inert.
+    const channel = pc.createDataChannel("controls", { ordered: true });
     bindChannel(peerId, channel);
     await pc.setLocalDescription(await pc.createOffer());
     sendSignal({ type: "signal", target: peerId, data: { description: pc.localDescription } });
@@ -233,7 +268,7 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
         if (!iceReady) { iceReady = true; window.clearTimeout(timeout); wsRef.current = socket; resolve(socket); }
         return;
       }
-      if (message.type === "room-created") { selfPeerIdRef.current = message.peerId; setSelfPeerId(message.peerId); setRoomCode(message.roomCode); setStatus("蓝方先手，等待访客"); }
+      if (message.type === "room-created") { selfPeerIdRef.current = message.peerId; setSelfPeerId(message.peerId); setRoomCode(message.roomCode); setStatus("房间已创建，等待访客"); }
       if (message.type === "join-pending") { selfPeerIdRef.current = message.peerId; setSelfPeerId(message.peerId); setRoomCode(message.roomCode); setStatus("等待房主批准"); }
       if (message.type === "join-approved") { setPeerRole(message.role); setStatus(message.role === "controller" ? "已获操作权限，正在连接" : "已进入观战模式，正在连接"); }
       if (message.type === "join-rejected") { setNotice(message.reason); setStatus("加入被拒绝"); }
@@ -242,9 +277,6 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
         controlRef.current = message.control;
         setPeers(message.peers);
         setControl(message.control);
-        setTurnSecondsLeft(message.control?.mode === "turns" && message.control?.phase === "playing" && message.control?.turnDeadline
-          ? Math.max(0, Math.ceil((message.control.turnDeadline - Date.now()) / 1000))
-          : null);
       }
       if (message.type === "begin-calibration") {
         if (companionRef.current?.readyState === WebSocket.OPEN && browserTargetReadyRef.current) {
@@ -310,17 +342,85 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
   const createRoom = async () => {
     setNotice("");
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+      const stream = await selectDisplayStream();
+      const videoTrack = stream.getVideoTracks()[0];
       streamRef.current = stream;
-      stream.getVideoTracks()[0].onended = () => setStatus("屏幕分享已停止");
+      videoTrack.onended = () => setStatus("屏幕分享已停止");
       setRole("host"); roleRef.current = "host";
       setStatus("正在连接本地信令服务");
       const socket = await connectSignaling();
-      socket.send(JSON.stringify({ type: "create-room", name: name.trim() || "房主", mode }));
+      socket.send(JSON.stringify({ type: "create-room", name: name.trim() || "房主", mode: "free" }));
     } catch (error) {
       streamRef.current?.getTracks().forEach((track) => track.stop()); streamRef.current = null;
       setRole(null); roleRef.current = null;
       setNotice(error instanceof DOMException && error.name === "NotAllowedError" ? "你取消了屏幕分享。" : "无法连接本地信令服务，请先运行 npm run dev。");
+    }
+  };
+
+  const changeSharedWindow = async () => {
+    if (roleRef.current !== "host" || isChangingShare) return;
+    setIsChangingShare(true);
+    setNotice("");
+    let nextStream: MediaStream | null = null;
+    const replacements: Array<{ sender: RTCRtpSender; previous: MediaStreamTrack | null }> = [];
+    try {
+      nextStream = await selectDisplayStream();
+      const previousStream = streamRef.current;
+      if (!previousStream) throw new Error("当前没有可替换的共享画面");
+      const nextVideoTrack = nextStream.getVideoTracks()[0];
+      let nextAudioTrack = nextStream.getAudioTracks()[0] ?? null;
+      if (pcsRef.current.size > 0 && previousStream.getAudioTracks().length === 0 && nextAudioTrack) {
+        nextStream.removeTrack(nextAudioTrack);
+        nextAudioTrack.stop();
+        nextAudioTrack = null;
+      }
+
+      for (const pc of pcsRef.current.values()) {
+        const videoSender = pc.getSenders().find((sender) => sender.track?.kind === "video");
+        if (!videoSender) throw new Error("当前连接缺少可替换的视频发送轨道");
+        replacements.push({ sender: videoSender, previous: videoSender.track });
+        await videoSender.replaceTrack(nextVideoTrack);
+        await preferSmoothVideo(videoSender);
+
+        const audioSender = pc.getTransceivers()
+          .find((transceiver) => transceiver.sender.track?.kind === "audio" || transceiver.receiver.track.kind === "audio")
+          ?.sender;
+        if (audioSender) {
+          replacements.push({ sender: audioSender, previous: audioSender.track });
+          await audioSender.replaceTrack(nextAudioTrack);
+        }
+      }
+
+      streamRef.current = nextStream;
+      nextVideoTrack.onended = () => setStatus("屏幕分享已停止，可点击“更换共享窗口”继续当前房间");
+      if (localVideoRef.current) localVideoRef.current.srcObject = nextStream;
+      previousStream.getTracks().forEach((track) => {
+        track.onended = null;
+        track.stop();
+      });
+
+      browserTargetReadyRef.current = false;
+      desktopControlEnabledRef.current = false;
+      calibrationActiveRef.current = false;
+      setDesktopControlEnabled(false);
+      setBrowserTargetId("");
+      setBrowserTargetReady(false);
+      setBrowserViewport(null);
+      setCalibrationState("off");
+      companionRef.current?.send(JSON.stringify({ type: "cancel-calibration" }));
+      companionRef.current?.send(JSON.stringify({ type: "set-control", enabled: false }));
+      companionRef.current?.send(JSON.stringify({ type: "set-turn", remote: false }));
+      companionRef.current?.send(JSON.stringify({ type: "refresh-targets" }));
+      sendSignal({ type: "reset-control-for-share" });
+      setLastCommand("共享窗口已更换，请重新选择控制目标并校准");
+      setStatus("共享窗口已更换，房间与访客连接保持不变");
+    } catch (error) {
+      await Promise.allSettled(replacements.reverse().map(({ sender, previous }) => sender.replaceTrack(previous)));
+      nextStream?.getTracks().forEach((track) => track.stop());
+      const cancelled = error instanceof DOMException && error.name === "NotAllowedError";
+      setNotice(cancelled ? "已取消更换共享窗口，当前共享保持不变。" : "更换共享窗口失败：" + (error instanceof Error ? error.message : "未知错误"));
+    } finally {
+      setIsChangingShare(false);
     }
   };
 
@@ -340,9 +440,7 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
     const state = controlRef.current;
     const allowed = state?.phase === "calibration"
       ? state.ownerPeerId === selfPeerIdRef.current
-      : state?.mode === "free"
-        ? state.phase === "playing"
-        : state?.phase === "playing" && state.ownerPeerId === selfPeerIdRef.current;
+      : state?.phase === "playing";
     if (peerRole !== "controller" || !allowed) return;
     for (const channel of channelsRef.current.values()) if (channel.readyState === "open") channel.send(JSON.stringify(event));
   };
@@ -371,8 +469,23 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
     });
   };
 
+  const sendCaptureInfo = (video?: HTMLVideoElement | null) => {
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (!track || companionRef.current?.readyState !== WebSocket.OPEN) return;
+    const settings = track.getSettings() as MediaTrackSettings & { displaySurface?: string };
+    companionRef.current.send(JSON.stringify({
+      type: "set-capture-info",
+      surface: settings.displaySurface === "monitor" ? "monitor" : "window",
+      width: video?.videoWidth || settings.width || 0,
+      height: video?.videoHeight || settings.height || 0,
+    }));
+  };
+
   const syncVideoAspect = (video: HTMLVideoElement) => {
-    if (video.videoWidth > 0 && video.videoHeight > 0) setVideoAspect(video.videoWidth / video.videoHeight);
+    if (video.videoWidth > 0 && video.videoHeight > 0) {
+      setVideoAspect(video.videoWidth / video.videoHeight);
+      if (roleRef.current === "host") sendCaptureInfo(video);
+    }
   };
 
   const connectCompanion = () => {
@@ -400,13 +513,13 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
     companionRef.current = socket;
     socket.onopen = () => {
       if (companionAttemptRef.current !== attempt) return socket.close();
-      socket.send(JSON.stringify({ type: "auth", code: companionCode.trim() }));
+      socket.send(JSON.stringify({ type: "auth", code: companionCode.trim(), protocols: ["mutiny-input-v6", "cdp-page-v5"] }));
     };
     socket.onmessage = (event) => {
       if (companionAttemptRef.current !== attempt) return;
       const message = JSON.parse(event.data);
       if (message.type === "auth-ok") {
-        if (message.protocol !== "cdp-page-v5") {
+        if (message.protocol !== "mutiny-input-v6") {
           socket.close();
           setCompanionState("off");
           setNotice("检测到旧版助手仍在运行。请在旧终端按 Ctrl+C，再重新运行 npm run companion:arm。");
@@ -415,17 +528,18 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
         desktopControlEnabledRef.current = false;
         setDesktopControlEnabled(false);
         setCompanionState("ready");
-        setLastCommand("浏览器助手已连接，请选择目标标签页");
+        setLastCommand("应用控制助手已连接，请选择控制目标");
         if (companionConnectedOnceRef.current) {
           sendSignal({ type: "reset-control-session", reason: "房主页面助手已重新连接，上一轮控制状态已清除" });
         }
         companionConnectedOnceRef.current = true;
+        sendCaptureInfo(localVideoRef.current);
         socket.send(JSON.stringify({ type: "set-turn", remote: Boolean(controlRef.current && controlRef.current.ownerPeerId !== selfPeerIdRef.current) }));
       }
       if (message.type === "targets") {
         setBrowserTargets(message.targets);
         setBrowserTargetId((current) => {
-          if (message.targets.some((target: BrowserTarget) => target.id === current)) return current;
+          if (message.targets.some((target: ControlTarget) => target.id === current)) return current;
           browserTargetReadyRef.current = false;
           sendSignal({ type: "set-calibration-ready", ready: false });
           setBrowserTargetReady(false);
@@ -442,8 +556,9 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
         setBrowserViewport(message.viewport);
         calibrationActiveRef.current = false;
         setCalibrationState("off");
-        setLastCommand(`已锁定页面：${message.target.title || message.target.url}`);
+        setLastCommand(`已锁定${message.target.kind === "window" ? "应用窗口" : "浏览器页面"}：${message.target.title || message.target.url}`);
         sendSignal({ type: "set-calibration-ready", ready: true });
+        sendCaptureInfo(localVideoRef.current);
         socket.send(JSON.stringify({ type: "set-turn", remote: Boolean(controlRef.current && controlRef.current.ownerPeerId !== selfPeerIdRef.current) }));
       }
       if (message.type === "target-closed") {
@@ -455,12 +570,12 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
         setBrowserViewport(null);
         calibrationActiveRef.current = false;
         setCalibrationState("off");
-        setNotice("目标标签页已关闭，请重新选择。");
+        setNotice("控制目标已关闭，请重新选择。");
       }
       if (message.type === "control-state") {
         desktopControlEnabledRef.current = message.enabled;
         setDesktopControlEnabled(message.enabled);
-        setLastCommand(message.enabled ? "指定浏览器页面控制已开启" : "已切回仅预览指针");
+        setLastCommand(message.enabled ? "指定目标的远程控制已开启" : "已切回仅预览指针");
         if (message.enabled && controlRef.current?.phase === "ready") sendSignal({ type: "start-game" });
       }
       if (message.type === "calibration-state") {
@@ -472,13 +587,20 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
         setLastCommand(message.state === "point-1" ? "请让远端点击画面中的定位点 1 / 2" : message.state === "point-2" ? "请让远端点击画面中的定位点 2 / 2" : message.state === "complete" ? "坐标校准完成，可以启用页面控制" : "坐标校准已停止");
         if (message.state === "complete") sendSignal({ type: "finish-calibration" });
       }
-      if (message.type === "cdp-error" || message.type === "input-error") setNotice(message.message);
-      if (message.type === "auth-error") { setCompanionState("off"); setNotice("浏览器助手授权码不正确，可以修改后重新连接。"); socket.close(); }
+      if (message.type === "cdp-error" || message.type === "native-error" || message.type === "input-error") {
+        setNotice(message.message);
+        if (message.type === "input-error" && message.operation === "start-calibration") {
+          calibrationActiveRef.current = false;
+          setCalibrationState("off");
+          sendSignal({ type: "cancel-calibration", reason: message.message });
+        }
+      }
+      if (message.type === "auth-error") { setCompanionState("off"); setNotice("应用控制助手授权码不正确，可以修改后重新连接。"); socket.close(); }
     };
     socket.onerror = () => {
       if (companionAttemptRef.current !== attempt) return;
       setCompanionState("off");
-      setNotice("无法连接浏览器助手，请先运行 npm run companion:arm，然后重试。");
+      setNotice("无法连接应用控制助手，请先运行 npm run companion:arm，然后重试。");
     };
     socket.onclose = () => {
       if (companionAttemptRef.current !== attempt) return;
@@ -515,12 +637,22 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
     companionRef.current?.send(JSON.stringify({ type: "set-control", enabled }));
   };
 
-  const requestCalibration = () => {
+  const startHostCalibration = (peerId: string) => {
     setNotice("");
-    sendSignal({ type: controlRef.current?.phase === "calibration" ? "restart-calibration" : "start-calibration" });
+    sendSignal({ type: "start-calibration", peerId });
   };
 
-  const cancelCalibration = () => sendSignal({ type: "cancel-calibration" });
+  const restartHostCalibration = () => {
+    setNotice("");
+    sendSignal({ type: "restart-calibration" });
+  };
+
+  const cancelHostCalibration = () => sendSignal({ type: "cancel-calibration" });
+
+  const tapRemoteKey = (key: string, code: string) => {
+    sendControl({ type: "key-down", key, code });
+    sendControl({ type: "key-up", key, code });
+  };
 
   const reset = useCallback(() => {
     companionAttemptRef.current += 1;
@@ -532,7 +664,7 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     wsRef.current = null; companionRef.current = null; streamRef.current = null;
     pcsRef.current.clear(); channelsRef.current.clear(); candidateQueueRef.current.clear();
-    peersRef.current = []; selfPeerIdRef.current = ""; controlRef.current = null; desktopControlEnabledRef.current = false; calibrationActiveRef.current = false; turnEnabledRef.current = false; rtcConfigRef.current = defaultRtcConfig(); setDesktopControlEnabled(false); setBrowserTargets([]); setBrowserTargetId(""); setBrowserTargetReady(false); setBrowserViewport(null); setCalibrationState("off"); setZoom(1); setRole(null); roleRef.current = null; setRoomCode(""); setSelfPeerId(""); setControl(null); setTurnSecondsLeft(null); setPeers([]); setConnectedPeers(0); setTurnStatus("正在检查 ICE"); setMediaPath("等待连接"); setStatus("本地服务未连接"); setNotice(""); setCompanionState("off");
+    peersRef.current = []; selfPeerIdRef.current = ""; controlRef.current = null; desktopControlEnabledRef.current = false; calibrationActiveRef.current = false; turnEnabledRef.current = false; rtcConfigRef.current = defaultRtcConfig(); setDesktopControlEnabled(false); setBrowserTargets([]); setBrowserTargetId(""); setBrowserTargetReady(false); setBrowserViewport(null); setCalibrationState("off"); setZoom(1); setRole(null); roleRef.current = null; setRoomCode(""); setSelfPeerId(""); setControl(null); setPeers([]); setConnectedPeers(0); setTurnStatus("正在检查 ICE"); setMediaPath("等待连接"); setStatus("本地服务未连接"); setNotice(""); setCompanionState("off");
   }, []);
 
   const closeHostedRoom = () => {
@@ -549,14 +681,6 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
     const timer = window.setInterval(() => sendSignal({ type: "control-heartbeat" }), 25_000);
     return () => window.clearInterval(timer);
   }, [control?.ownerPeerId, role, selfPeerId, sendSignal]);
-
-  useEffect(() => {
-    if (control?.mode !== "turns" || control.phase !== "playing" || !control.turnDeadline) return;
-    const update = () => setTurnSecondsLeft(Math.max(0, Math.ceil((control.turnDeadline! - Date.now()) / 1000)));
-    const kickoff = window.setTimeout(update, 0);
-    const timer = window.setInterval(update, 250);
-    return () => { window.clearTimeout(kickoff); window.clearInterval(timer); };
-  }, [control?.mode, control?.phase, control?.turnDeadline]);
 
   useEffect(() => {
     if (!role) return;
@@ -592,30 +716,29 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
   const connected = connectedPeers > 0;
   const pendingPeers = peers.filter((peer) => !peer.approved);
   const approvedPeers = peers.filter((peer) => peer.approved);
-  const remoteControllers = approvedPeers.filter((peer) => peer.role === "controller");
   const hasControl = Boolean(selfPeerId && control?.ownerPeerId === selfPeerId);
-  const activeMode = control?.mode ?? mode;
-  const isTurnMode = activeMode === "turns";
   const canGuestControl = role === "guest" && peerRole === "controller" && Boolean(control && (
     control.phase === "calibration"
       ? hasControl
-      : control.phase === "playing" && (control.mode === "free" || hasControl)
+      : control.phase === "playing"
   ));
-  const turnLabel = control?.phase === "calibration" ? "校准阶段" : control?.phase === "ready" ? "校准完成" : control?.phase === "playing" ? isTurnMode ? `第 ${control.turnNumber} 回合` : "自由控制" : "准备阶段";
-  const turnTitle = control?.phase === "setup" ? "等待远端与校准" : control?.phase === "calibration" ? `远端校准 · ${control.ownerName}` : control?.phase === "ready" ? "等待启用页面控制" : !isTurnMode ? "通用远程控制已启用" : control?.side === "red" ? `红方 · ${control.ownerName}` : "蓝方 · 房主";
-  const turnDescription = control?.phase === "setup" ? role === "host" ? "批准操作者、连接页面助手并选定标签页；随后由远端发起两点校准。" : control?.calibrationReady ? "助手页面已准备好，你可以在这里发起两点校准。" : "等待房主连接页面助手并选定目标标签页。" : control?.phase === "calibration" ? hasControl ? "请依次点击共享画面中的两个定位点；校准不计入正式回合。" : "正在等待远端完成两点校准，本地游戏输入已锁定。" : control?.phase === "ready" ? role === "host" ? isTurnMode ? "点击“启用页面控制”后，蓝方第 1 回合与 60 秒倒计时同时开始。" : "点击“启用页面控制”后，所有获准操作者均可持续控制。" : "校准已完成，等待房主启用页面控制。" : !isTurnMode ? "获准的远端操作者可以持续输入；此模式没有回合和倒计时。" : hasControl ? "轮到你操作；60 秒结束会自动交棒，也可以主动结束回合。" : "当前输入已锁定，请等待对方结束回合或倒计时归零。";
+  const selectedTarget = browserTargets.find((target) => target.id === browserTargetId);
+  const nativeTarget = selectedTarget?.kind === "window";
+  const controlLabel = control?.phase === "calibration" ? "校准阶段" : control?.phase === "ready" ? "校准完成" : control?.phase === "playing" ? "远程控制" : "准备阶段";
+  const controlTitle = control?.phase === "setup" ? "等待房主发起校准" : control?.phase === "calibration" ? `房主正在校准 · ${control.ownerName}` : control?.phase === "ready" ? "等待启用远程控制" : "远程控制已启用";
+  const controlDescription = control?.phase === "setup" ? role === "host" ? "批准操作者、连接应用控制助手并选定目标；随后由房主在成员列表中发起校准。" : "等待房主选定控制目标并发起校准。" : control?.phase === "calibration" ? role === "host" ? "目标窗口已自动置前；房主可以重新开始或取消本次校准。" : hasControl ? "房主已发起校准；Chromium 目标请依次点击两个定位点，Windows 应用会自动完成映射。" : "房主正在为其他操作者校准，本地输入暂不可用。" : control?.phase === "ready" ? role === "host" ? "点击“启用远程控制”会再次置前目标窗口，并开放远程输入。" : "校准已完成，等待房主启用远程控制。" : "获准的远端操作者可以持续使用鼠标和键盘。";
 
   return <main className="shell">
     <nav className="topbar">
       <div className="brand"><span className="brandMark">M</span><span>Mutiny Relay</span></div>
-      <a className="prototypeTag" href="/">← 模式选择</a>
+      <a className="prototypeTag" href="/">← 返回首页</a>
     </nav>
 
     {!role && <>
       <section className="hero compactHero">
         <div className="eyebrow">SHORT CODE · HOST APPROVAL · LIVE STATS</div>
-        <h1>{isTurnMode ? "红蓝轮换，\n即开即玩" : "通用同屏，\n自由协作"}</h1>
-        <p>{isTurnMode ? "双方在独立校准后按 60 秒回合轮流操作，蓝方房主固定先手。" : "不设回合和倒计时；所有获准操作者都可控制选定的 Chromium 页面。"}</p>
+        <h1>通用同屏，<br />自由协作</h1>
+        <p>获准操作者可以控制选定的浏览器页面、Windows 应用窗口或共享屏幕。</p>
         <input className="nameInput" value={name} onChange={(event) => setName(event.target.value)} placeholder="你的昵称（可选）" maxLength={24} />
         <div className="actions"><button className="primary" onClick={createRoom}>分享屏幕并创建房间</button></div>
         <div className="joinBox">
@@ -629,16 +752,16 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
     </>}
 
     {role && <section className="workspace">
-      <div className="workspaceTitle"><div><span className={`rolePill ${role === "host" ? "blueSide" : "redSide"}`}>{role === "host" ? isTurnMode ? "蓝方房主" : "房主" : peerRole === "controller" ? isTurnMode ? "红方玩家" : "远端操作者" : "观众"}</span><h1>{role === "host" ? `房间 ${roomCode || "······"}` : `加入 ${roomCode || joinCode}`}</h1></div><button className="textButton" onClick={role === "host" ? closeHostedRoom : reset}>{role === "host" ? "关闭房间" : "退出房间"}</button></div>
+      <div className="workspaceTitle"><div><span className="rolePill">{role === "host" ? "房主" : peerRole === "controller" ? "远端操作者" : "观众"}</span><h1>{role === "host" ? `房间 ${roomCode || "······"}` : `加入 ${roomCode || joinCode}`}</h1></div><button className="textButton" onClick={role === "host" ? closeHostedRoom : reset}>{role === "host" ? "关闭房间" : "退出房间"}</button></div>
       <div className="connectionBar"><span className={connected ? "dot online" : "dot"} />{status}<span className="secure">{connectedPeers} 个连接 · {turnStatus} · {mediaPath} · DTLS / SRTP</span></div>
       <div className="qualityBar"><div><span>延迟</span><strong>{quality.rtt == null ? "—" : `${quality.rtt} ms`}</strong></div><div><span>视频码率</span><strong>{quality.bitrate ? `${quality.bitrate} kbps` : "—"}</strong></div><div><span>帧率</span><strong>{quality.fps == null ? "—" : `${Math.round(quality.fps)} fps`}</strong></div><div><span>丢包</span><strong>{quality.lost}</strong></div></div>
       <div className="grid">
         <div>
           <div className="stage videoStage">
-            <div className="stageHeader"><span><i className={connected ? "live" : ""} /> {connected ? "实时画面" : "等待连接"}</span>{role === "guest" ? <div className="viewerTools"><button aria-label="缩小" disabled={zoom <= 1} onClick={() => setZoom((value) => Math.max(1, value - 0.25))}>−</button><b>{Math.round(zoom * 100)}%</b><button aria-label="放大" disabled={zoom >= 2.5} onClick={() => setZoom((value) => Math.min(2.5, value + 0.25))}>＋</button><button onClick={() => void videoViewportRef.current?.requestFullscreen()}>全屏</button></div> : <span>正在向 {connectedPeers} 人分享</span>}</div>
+            <div className="stageHeader"><span><i className={connected ? "live" : ""} /> {connected ? "实时画面" : "等待连接"}</span>{role === "guest" ? <div className="viewerTools"><button aria-label="缩小" disabled={zoom <= 1} onClick={() => setZoom((value) => Math.max(1, value - 0.25))}>−</button><b>{Math.round(zoom * 100)}%</b><button aria-label="放大" disabled={zoom >= 2.5} onClick={() => setZoom((value) => Math.min(2.5, value + 0.25))}>＋</button><button onClick={() => void videoViewportRef.current?.requestFullscreen()}>全屏</button></div> : <div className="hostShareTools"><span>正在向 {connectedPeers} 人分享</span><button disabled={isChangingShare} onClick={changeSharedWindow}>{isChangingShare ? "等待选择…" : "更换共享窗口"}</button></div>}</div>
             <div className="videoViewport" ref={videoViewportRef}>
               {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex -- 这是接收完整鼠标与键盘输入的远程应用画布。 */}
-              <div className={`videoWrap ${role === "guest" ? canGuestControl ? "turnActive" : "turnLocked" : ""}`} role="application" aria-label={role === "guest" ? canGuestControl ? "红方远程控制画面" : "等待回合的实时画面" : "房主共享画面"} style={{ aspectRatio: videoAspect, width: role === "guest" ? `${zoom * 100}%` : "100%" }} tabIndex={canGuestControl ? 0 : -1}
+              <div className={`videoWrap ${role === "guest" ? canGuestControl ? "controlActive" : "controlLocked" : ""}`} role="application" aria-label={role === "guest" ? canGuestControl ? "远程控制画面" : "只读实时画面" : "房主共享画面"} style={{ aspectRatio: videoAspect, width: role === "guest" ? `${zoom * 100}%` : "100%" }} tabIndex={canGuestControl ? 0 : -1}
                 onPointerMove={canGuestControl ? (event) => pointerEvent(event, "pointer") : undefined}
                 onPointerDown={canGuestControl ? (event) => { event.preventDefault(); event.currentTarget.focus(); event.currentTarget.setPointerCapture(event.pointerId); pointerEvent(event, "pointer-down"); } : undefined}
                 onPointerUp={canGuestControl ? (event) => { event.preventDefault(); pointerEvent(event, "pointer-up"); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); } : undefined}
@@ -655,38 +778,42 @@ export default function RelayRoom({ mode }: { mode: "free" | "turns" }) {
             </div>
           </div>
           <div className="commandLog"><span>最近操作</span><strong>{lastCommand}</strong></div>
+          {role === "guest" && <div className="mobileControls" aria-label="触屏快捷键">
+            <div className="mobileDpad"><button disabled={!canGuestControl} onClick={() => tapRemoteKey("ArrowUp", "ArrowUp")}>↑</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey("ArrowLeft", "ArrowLeft")}>←</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey("ArrowDown", "ArrowDown")}>↓</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey("ArrowRight", "ArrowRight")}>→</button></div>
+            <div className="mobileActionKeys"><button disabled={!canGuestControl} onClick={() => tapRemoteKey("Escape", "Escape")}>ESC</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey(" ", "Space")}>SPACE</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey("Enter", "Enter")}>ENTER</button></div>
+            <input aria-label="发送文字到远端应用" disabled={!canGuestControl} enterKeyHint="send" placeholder="点此打开手机键盘" value="" onChange={(event) => { for (const character of event.target.value) tapRemoteKey(character, ""); }} onKeyDown={(event) => { if (event.key.length !== 1) { event.preventDefault(); tapRemoteKey(event.key, event.code); } }} />
+          </div>}
         </div>
 
         <aside className="panel roomPanel">
-          <div className={`turnCard ${isTurnMode ? control?.side || "blue" : "free"}`}><span>{turnLabel}</span>{isTurnMode && control?.phase === "playing" && <b className={`turnClock ${(turnSecondsLeft ?? 60) <= 10 ? "urgent" : ""}`} aria-label="本回合剩余时间">{turnSecondsLeft ?? 60}<small>秒</small></b>}<strong>{turnTitle}</strong><p>{turnDescription}</p>{isTurnMode && control?.phase === "playing" && hasControl && (role === "host" ? <button disabled={!remoteControllers.length || !desktopControlEnabled} onClick={() => sendSignal({ type: "pass-control" })}>{!remoteControllers.length ? "等待红方操作者" : !desktopControlEnabled ? "请先启用页面控制" : "结束蓝方回合，交给红方"}</button> : peerRole === "controller" ? <button onClick={() => sendSignal({ type: "pass-control" })}>结束红方回合，交还蓝方</button> : null)}{role === "host" && control?.phase === "calibration" && !hasControl && <button className="reclaimButton" onClick={() => sendSignal({ type: "reclaim-control" })}>取消校准并收回</button>}</div>
+          <div className="turnCard free"><span>{controlLabel}</span><strong>{controlTitle}</strong><p>{controlDescription}</p>{role === "host" && control?.phase === "calibration" && <button className="reclaimButton" onClick={cancelHostCalibration}>取消本次校准</button>}</div>
           {role === "host" ? <>
             <div className="roomCode"><span>房间码</span><strong>{roomCode || "······"}</strong><small>同一局域网或能访问此信令服务的浏览器均可加入</small></div>
             <h2>成员与权限 <em>{peers.length}/8</em></h2>
             {!peers.length && <p className="emptyText">还没有访客，等待朋友输入房间码。</p>}
-            {pendingPeers.map((peer) => <div className="peer pending" key={peer.peerId}><div><strong>{peer.name}</strong><small>申请：{peer.role === "controller" ? isTurnMode ? "红方" : "操作" : "观战"}</small></div><div className="peerActions"><button onClick={() => approve(peer.peerId, "controller")}>设为{isTurnMode ? "红方" : "操作者"}</button><button onClick={() => approve(peer.peerId, "spectator")}>仅观战</button><button className="danger" onClick={() => sendSignal({ type: "reject-peer", peerId: peer.peerId })}>拒绝</button></div></div>)}
-            {approvedPeers.map((peer) => <div className="peer" key={peer.peerId}><div><strong>{peer.name}</strong><small>{peer.role === "controller" ? control?.phase === "calibration" && control.ownerPeerId === peer.peerId ? "正在完成校准" : !isTurnMode && control?.phase === "playing" ? "可持续操作" : control?.ownerPeerId === peer.peerId ? "红方正在操作" : "红方候选，等待轮换" : "只读观战"}</small></div><button className="roleToggle" onClick={() => setRemoteRole(peer.peerId, peer.role === "controller" ? "spectator" : "controller")}>{peer.role === "controller" ? "改为观战" : `设为${isTurnMode ? "红方" : "操作者"}`}</button></div>)}
+            {pendingPeers.map((peer) => <div className="peer pending" key={peer.peerId}><div><strong>{peer.name}</strong><small>申请：{peer.role === "controller" ? "操作" : "观战"}</small></div><div className="peerActions"><button onClick={() => approve(peer.peerId, "controller")}>设为操作者</button><button onClick={() => approve(peer.peerId, "spectator")}>仅观战</button><button className="danger" onClick={() => sendSignal({ type: "reject-peer", peerId: peer.peerId })}>拒绝</button></div></div>)}
+            {approvedPeers.map((peer) => <div className="peer" key={peer.peerId}><div><strong>{peer.name}</strong><small>{peer.role === "controller" ? control?.phase === "calibration" && control.ownerPeerId === peer.peerId ? "等待其点击校准点" : control?.phase === "playing" ? "可持续操作" : "已获操作权限" : "只读观战"}</small></div><div className="peerActions memberActions">{peer.role === "controller" && <button disabled={!browserTargetReady || control?.phase === "calibration"} onClick={() => startHostCalibration(peer.peerId)}>{control?.phase === "ready" || control?.phase === "playing" ? "重新校准" : "开始校准"}</button>}<button className="roleToggle" onClick={() => setRemoteRole(peer.peerId, peer.role === "controller" ? "spectator" : "controller")}>{peer.role === "controller" ? "改为观战" : "设为操作者"}</button></div></div>)}
             <div className="companionBox">
-              <h2>Chromium 页面控制助手</h2>
-              <p>先用远程调试端口启动一个独立 Chromium，再运行 <code>npm run companion:arm</code>。助手只向选定标签页发送事件，不会移动系统鼠标。</p>
+              <h2>浏览器 / Windows 应用控制助手</h2>
+              <p>运行 <code>npm run companion:arm</code> 后，可锁定 Chromium 标签页或任意可见 Windows 应用窗口。原生窗口模式会移动系统鼠标，请只授权可信访客。</p>
               <div><input value={companionCode} onChange={(event) => setCompanionCode(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="授权码" maxLength={6} /><button disabled={companionCode.length !== 6 || companionState === "connecting"} onClick={connectCompanion}>{companionState === "connecting" ? "连接中…" : companionState === "ready" ? "重新连接" : "连接"}</button></div>
               {companionState === "ready" && <>
-                <div className="targetPicker"><select aria-label="选择要控制的 Chromium 标签页" value={browserTargetId} onChange={(event) => selectBrowserTarget(event.target.value)}><option value="">选择目标标签页</option>{browserTargets.map((target) => <option key={target.id} value={target.id}>{target.title || target.url}</option>)}</select><button aria-label="刷新标签页列表" onClick={() => companionRef.current?.send(JSON.stringify({ type: "refresh-targets" }))}>刷新</button></div>
-                <div className="calibrationGate"><strong>{calibrationState === "point-1" || calibrationState === "point-2" ? "远端正在校准" : browserTargetReady ? "等待远端发起校准" : "校准尚未就绪"}</strong><small>{calibrationState === "point-1" ? "请远端点击共享画面中的定位点 1 / 2" : calibrationState === "point-2" ? "请远端点击共享画面中的定位点 2 / 2" : calibrationState === "complete" ? "校准完成，现在可以启用页面控制" : browserTargetReady ? "校准按钮位于远端窗口，房主无需代为点击" : "请先选择并锁定一个目标标签页"}</small></div>
-                <div className={`controlGate ${desktopControlEnabled ? "armed" : ""}`}><button disabled={!browserTargetReady || (!desktopControlEnabled && control?.phase !== "ready" && control?.phase !== "playing")} onClick={toggleDesktopControl}>{desktopControlEnabled ? "停止页面控制" : "启用页面控制"}</button><small>{desktopControlEnabled ? `事件只会发送到当前锁定的标签页${browserViewport ? `（${browserViewport.width} × ${browserViewport.height} CSS px）` : ""}` : browserTargetReady ? `安全预览模式；目标 viewport ${browserViewport ? `${browserViewport.width} × ${browserViewport.height} CSS px` : "已读取"}` : "请先选择并锁定一个目标标签页"}</small></div>
+                <div className="targetPicker"><select aria-label="选择要控制的浏览器页面或应用窗口" value={browserTargetId} onChange={(event) => selectBrowserTarget(event.target.value)}><option value="">选择控制目标</option><optgroup label="Chromium 标签页">{browserTargets.filter((target) => target.kind === "browser").map((target) => <option key={target.id} value={target.id}>{target.title || target.url}</option>)}</optgroup><optgroup label="Windows 应用窗口">{browserTargets.filter((target) => target.kind === "window").map((target) => <option key={target.id} value={target.id}>{target.title}</option>)}</optgroup></select><button aria-label="刷新控制目标列表" onClick={() => companionRef.current?.send(JSON.stringify({ type: "refresh-targets" }))}>刷新</button></div>
+                <div className="calibrationGate"><strong>{calibrationState === "point-1" || calibrationState === "point-2" ? `正在为 ${control?.ownerName || "远端操作者"} 校准` : browserTargetReady ? nativeTarget ? "窗口坐标可自动映射" : "等待房主选择操作者" : "校准尚未就绪"}</strong><small>{calibrationState === "point-1" ? "目标已置前，请远端点击共享画面中的定位点 1 / 2" : calibrationState === "point-2" ? "请远端点击共享画面中的定位点 2 / 2" : calibrationState === "complete" ? "坐标映射完成，现在可以启用控制" : browserTargetReady ? nativeTarget ? "在成员列表点击“开始校准”，窗口会置前并自动完成映射" : "在成员列表选择操作者并由房主发起两点校准" : "请先选择并锁定一个控制目标"}</small>{control?.phase === "calibration" && <div className="calibrationActions"><button onClick={restartHostCalibration}>重新开始校准</button><button className="cancelButton" onClick={cancelHostCalibration}>取消校准</button></div>}</div>
+                <div className={`controlGate ${desktopControlEnabled ? "armed" : ""}`}><button disabled={!browserTargetReady || (!desktopControlEnabled && control?.phase !== "ready" && control?.phase !== "playing")} onClick={toggleDesktopControl}>{desktopControlEnabled ? "停止远程控制" : "启用远程控制"}</button><small>{desktopControlEnabled ? `事件只会发送到当前锁定的${nativeTarget ? "应用窗口（系统鼠标会移动）" : "浏览器标签页"}${browserViewport ? `（${browserViewport.width} × ${browserViewport.height}）` : ""}` : browserTargetReady ? `安全预览模式；目标尺寸 ${browserViewport ? `${browserViewport.width} × ${browserViewport.height}` : "已读取"}` : "请先选择并锁定一个控制目标"}</small></div>
               </>}
             </div>
           </> : <>
-            <div className="roomCode"><span>当前房间</span><strong>{roomCode || joinCode}</strong><small>{peerRole === "controller" ? control?.phase === "calibration" && hasControl ? "远端校准阶段" : canGuestControl ? isTurnMode ? "轮到红方，你可以操作" : "自由控制已启用" : control?.phase === "setup" && control.calibrationReady ? "页面已就绪，请开始校准" : isTurnMode ? "等待蓝方交出控制权" : "等待房主启用页面控制" : "你处于只读观战模式"}</small></div>
-            {peerRole === "controller" && control?.phase === "setup" && <div className="calibrationGate remoteCalibration"><button disabled={!control.calibrationReady} onClick={requestCalibration}>开始两点校准</button><small>{control.calibrationReady ? "依次点击共享画面中的两个定位点；完成后由房主启用控制。" : "等待房主连接助手并选定目标标签页。"}</small></div>}
-            {peerRole === "controller" && control?.phase === "calibration" && hasControl && <div className="calibrationGate remoteCalibration"><strong>{control.calibrationMessage || (control.calibrationStep === "point-2" ? "请点击第 2 个定位点" : "请点击第 1 个定位点")}</strong><div className="calibrationActions"><button onClick={requestCalibration}>重新开始校准</button><button className="cancelButton" onClick={cancelCalibration}>取消校准</button></div><small>失败后可以继续点击第一个定位点，也可以随时重新开始或取消；取消后不会保留输入锁。</small></div>}
-            {peerRole === "controller" && (control?.phase === "ready" || control?.phase === "playing" && (!isTurnMode || hasControl)) && <div className="calibrationGate remoteCalibration"><button disabled={!control.calibrationReady} onClick={requestCalibration}>重新校准坐标</button><small>{control.calibrationReady ? "会暂停当前控制状态并重新进入独立校准阶段，完成后需要房主再次启用页面控制。" : "房主页面助手尚未准备好，暂时不能重新校准。"}</small></div>}
-            <div className={`permissionCard ${peerRole}`}><b>{peerRole === "controller" ? control?.phase === "calibration" && hasControl ? "CAL" : canGuestControl ? "PLAY" : "WAIT" : "VIEW"}</b><strong>{peerRole === "controller" ? control?.phase === "calibration" && hasControl ? "两点校准" : canGuestControl ? isTurnMode ? "红方回合" : "远端控制" : isTurnMode ? "等待蓝方回合" : "等待启用控制" : "只读观战"}</strong><p>{peerRole === "controller" ? control?.phase === "calibration" && hasControl ? "依次点击两个定位点；正式控制尚未开始。" : canGuestControl ? isTurnMode ? "移动和点击视频画面，聚焦后可使用方向键；完成后点击结束回合。" : "移动和点击视频画面，聚焦后可使用键盘；通用模式不会自动收回控制。" : "视频仍可观看，但鼠标和键盘事件不会发送。" : `房主可以把你设为${isTurnMode ? "红方玩家" : "远端操作者"}。`}</p></div>
+            <div className="roomCode"><span>当前房间</span><strong>{roomCode || joinCode}</strong><small>{peerRole === "controller" ? control?.phase === "calibration" && hasControl ? "房主已发起校准，请按提示操作" : canGuestControl ? "远程控制已启用" : control?.phase === "setup" ? "等待房主发起校准" : "等待房主启用远程控制" : "你处于只读观战模式"}</small></div>
+            {peerRole === "controller" && control?.phase === "setup" && <div className="calibrationGate remoteCalibration"><strong>校准由房主控制</strong><small>等待房主连接助手、选择控制目标并为你发起校准。</small></div>}
+            {peerRole === "controller" && control?.phase === "calibration" && hasControl && <div className="calibrationGate remoteCalibration"><strong>{control.calibrationMessage || (control.calibrationStep === "point-2" ? "请点击第 2 个定位点" : "请点击第 1 个定位点")}</strong><small>只需按提示点击定位点；重新开始和取消由房主操作。</small></div>}
+            <div className={`permissionCard ${peerRole}`}><b>{peerRole === "controller" ? control?.phase === "calibration" && hasControl ? "CAL" : canGuestControl ? "PLAY" : "WAIT" : "VIEW"}</b><strong>{peerRole === "controller" ? control?.phase === "calibration" && hasControl ? "校准中" : canGuestControl ? "远端控制" : "等待启用控制" : "只读观战"}</strong><p>{peerRole === "controller" ? control?.phase === "calibration" && hasControl ? "Windows 应用会自动映射；Chromium 目标请依次点击两个定位点。" : canGuestControl ? "移动和点击视频画面，聚焦后可使用键盘。" : "视频仍可观看，但鼠标和键盘事件不会发送。" : "房主可以把你设为远端操作者。"}</p></div>
           </>}
           {notice && <p className="notice smallNotice" role="alert">{notice}</p>}
           <div className="privacy"><span>◆</span><p><strong>本地信令，点对点媒体</strong><br />服务器只交换连接信息，不保存画面；多人观战时房主会为每人上传一路视频。</p></div>
         </aside>
       </div>
-      <p className="limitation">浏览器助手和 Chromium 调试端口均只监听本机地址，并且每次启动都需要新的授权码。建议只分享目标标签页，并为远程调试使用独立浏览器配置目录。</p>
+      <p className="limitation">控制助手和 Chromium 调试端口均只监听本机地址，并且每次启动都需要新的授权码。分享应用时，请在浏览器共享选择器与控制助手中选择同一个窗口；Windows 原生模式不会屏蔽房主本地输入。</p>
     </section>}
   </main>;
 }

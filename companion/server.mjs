@@ -1,8 +1,9 @@
 import crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
+import { WindowsNativeHost } from "./windows-native.mjs";
 
 if (!process.argv.includes("--arm")) {
-  console.log("浏览器控制助手未启动。确认要允许远程输入后，请运行：npm run companion:arm");
+  console.log("应用控制助手未启动。确认要允许远程输入后，请运行：npm run companion:arm");
   process.exit(0);
 }
 
@@ -25,18 +26,20 @@ let controller = null;
 let target = null;
 let calibration = null;
 let coordinateMap = { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
+let captureInfo = { surface: "window", width: 0, height: 0 };
+const nativeHost = new WindowsNativeHost();
 
 function reply(socket, message) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
 
-async function listTargets() {
+async function listBrowserTargets() {
   const response = await fetch(new URL("/json/list", cdpBase));
   if (!response.ok) throw new Error(`CDP 返回 HTTP ${response.status}`);
   const entries = await response.json();
   return entries
     .filter((entry) => entry.type === "page" && entry.webSocketDebuggerUrl)
-    .map(({ id, title, url, webSocketDebuggerUrl }) => ({ id, title, url, webSocketDebuggerUrl }));
+    .map(({ id, title, url, webSocketDebuggerUrl }) => ({ id, title, url, webSocketDebuggerUrl, kind: "browser" }));
 }
 
 class CdpTarget {
@@ -99,6 +102,10 @@ class CdpTarget {
     return this.viewport;
   }
 
+  async activate() {
+    await this.send("Page.bringToFront");
+  }
+
   async setLocalInputLocked(locked) {
     this.localInputLocked = Boolean(locked);
     await this.send("Input.setIgnoreInputEvents", { ignore: this.localInputLocked });
@@ -143,6 +150,30 @@ class CdpTarget {
   }
 }
 
+class NativeWindowTarget {
+  constructor(info) {
+    this.info = { ...info, kind: "window", url: "Windows 应用窗口" };
+    this.handle = Number(String(info.id).slice("win:".length));
+    this.localInputLocked = false;
+  }
+
+  async getViewport() {
+    const { bounds } = await nativeHost.bounds(this.handle);
+    return { width: bounds[2] - bounds[0], height: bounds[3] - bounds[1] };
+  }
+
+  async activate() {
+    await nativeHost.activate(this.handle);
+  }
+
+  async setLocalInputLocked() {
+    // Windows 的全局输入锁风险过高。原生模式只在收到已授权事件时激活目标窗口。
+  }
+
+  async setRemoteDispatch() {}
+  close() {}
+}
+
 async function releaseTarget(instance) {
   if (!instance) return;
   try { await instance.setLocalInputLocked(false); } catch { /* A closing target may no longer accept CDP commands. */ }
@@ -167,7 +198,26 @@ function virtualKey(key) {
 }
 
 async function dispatchInput(message) {
-  if (!target) throw new Error("尚未选择目标页面");
+  if (!target) throw new Error("尚未选择控制目标");
+  if (target instanceof NativeWindowTarget) {
+    const normalized = {
+      ...message,
+      x: Number(message.x) * coordinateMap.scaleX + coordinateMap.offsetX,
+      y: Number(message.y) * coordinateMap.scaleY + coordinateMap.offsetY,
+    };
+    if (message.type === "pointer") return nativeHost.pointer(target.handle, normalized, "move", captureInfo.surface);
+    if (message.type === "pointer-down") return nativeHost.pointer(target.handle, normalized, "down", captureInfo.surface);
+    if (message.type === "pointer-up") return nativeHost.pointer(target.handle, normalized, "up", captureInfo.surface);
+    if (message.type === "click") return nativeHost.pointer(target.handle, normalized, "click", captureInfo.surface);
+    if (["key", "key-down", "key-up"].includes(message.type)) {
+      const keyCode = virtualKey(String(message.key || ""));
+      if (!keyCode) return;
+      const code = String(message.code || "");
+      if (message.type === "key" || message.type === "key-down") await nativeHost.key(target.handle, keyCode, code, true);
+      if (message.type === "key" || message.type === "key-up") await nativeHost.key(target.handle, keyCode, code, false);
+    }
+    return;
+  }
   await target.setRemoteDispatch(true);
   try {
     if (["pointer", "pointer-down", "pointer-up", "click"].includes(message.type)) {
@@ -223,6 +273,7 @@ async function dispatchInput(message) {
 const calibrationPoints = [{ x: 0.12, y: 0.12 }, { x: 0.88, y: 0.88 }];
 
 async function showCalibrationPoint(index) {
+  if (!(target instanceof CdpTarget)) throw new Error("只有 Chromium 标签页需要两点校准");
   const point = calibrationPoints[index];
   const label = index === 0 ? "1 / 2" : "2 / 2";
   await target.send("Runtime.evaluate", {
@@ -247,7 +298,7 @@ async function showCalibrationPoint(index) {
 }
 
 async function removeCalibrationPoint() {
-  if (!target) return;
+  if (!(target instanceof CdpTarget)) return;
   await target.send("Runtime.evaluate", {
     expression: "document.getElementById('mutiny-relay-calibration')?.remove()",
   });
@@ -283,11 +334,23 @@ async function handleCalibration(message, socket) {
 }
 
 async function sendTargets(socket) {
-  try {
-    const entries = await listTargets();
-    reply(socket, { type: "targets", targets: entries.map((entry) => ({ id: entry.id, title: entry.title, url: entry.url })) });
-  } catch (error) {
-    reply(socket, { type: "cdp-error", message: `无法连接 Chromium 调试端口：${error.message}` });
+  let browserEntries = [];
+  let nativeEntries = [];
+  let browserError = null;
+  let nativeError = null;
+  try { browserEntries = await listBrowserTargets(); }
+  catch (error) { browserError = `无法连接 Chromium 调试端口：${error.message}`; }
+  try { nativeEntries = await nativeHost.list(); }
+  catch (error) { nativeError = error.message; }
+  reply(socket, { type: "targets", targets: [
+    ...browserEntries.map((entry) => ({ id: entry.id, title: entry.title, url: entry.url, kind: "browser" })),
+    ...nativeEntries.map((entry) => ({ ...entry, url: "Windows 应用窗口", kind: "window" })),
+  ], availability: { browser: !browserError, nativeWindows: !nativeError }, warnings: [browserError, nativeError].filter(Boolean) });
+  if (!browserEntries.length && !nativeEntries.length) {
+    reply(socket, {
+      type: "input-error",
+      message: nativeError || "没有找到可控制的目标。请先打开一个可见的 Windows 应用窗口，或重新启动专用 Chromium。",
+    });
   }
 }
 
@@ -321,34 +384,54 @@ wss.on("connection", (socket) => {
       void releaseTarget(previousTarget);
       controller = socket;
       authenticated = true;
-      reply(socket, { type: "auth-ok", protocol: "cdp-page-v5" });
+      const requestedProtocols = Array.isArray(message.protocols) ? message.protocols.map(String) : [];
+      const negotiatedProtocol = requestedProtocols.includes("mutiny-input-v6") ? "mutiny-input-v6" : "cdp-page-v5";
+      reply(socket, { type: "auth-ok", protocol: negotiatedProtocol, capabilities: { browser: true, nativeWindows: process.platform === "win32" } });
       await sendTargets(socket);
-      console.log("房主页面已连接。请选择目标标签页；按 Ctrl+C 可立即停止。");
+      console.log("房主页面已连接。请选择浏览器标签页或 Windows 应用窗口；按 Ctrl+C 可立即停止。");
       return;
     }
     try {
       if (message.type === "refresh-targets") return await sendTargets(socket);
+      if (message.type === "set-capture-info") {
+        captureInfo = {
+          surface: message.surface === "monitor" ? "monitor" : "window",
+          width: Math.max(0, Number(message.width) || 0),
+          height: Math.max(0, Number(message.height) || 0),
+        };
+        return;
+      }
       if (message.type === "select-target") {
-        const entries = await listTargets();
+        const isNative = String(message.targetId).startsWith("win:");
+        const entries = isNative ? await nativeHost.list() : await listBrowserTargets();
         const selected = entries.find((entry) => entry.id === message.targetId);
-        if (!selected) throw new Error("目标页面不存在，请刷新列表");
+        if (!selected) throw new Error("控制目标不存在，请刷新列表");
         armed = false;
         calibration = null;
         coordinateMap = { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
         const previousTarget = target;
         target = null;
         void releaseTarget(previousTarget);
-        const nextTarget = new CdpTarget(selected);
-        await nextTarget.ready;
+        const nextTarget = isNative ? new NativeWindowTarget(selected) : new CdpTarget(selected);
+        if (nextTarget.ready) await nextTarget.ready;
         const viewport = await nextTarget.getViewport();
         target = nextTarget;
         await target.setLocalInputLocked(false);
-        reply(socket, { type: "target-selected", target: { id: selected.id, title: selected.title, url: selected.url }, viewport });
-        console.log(`已锁定目标标签页：${selected.title} (${selected.url})`);
+        reply(socket, { type: "target-selected", target: { id: selected.id, title: selected.title, url: selected.url, kind: isNative ? "window" : "browser" }, viewport });
+        console.log(`已锁定${isNative ? "应用窗口" : "浏览器标签页"}：${selected.title}${selected.url ? ` (${selected.url})` : ""}`);
         return;
       }
       if (message.type === "set-control") {
-        if (message.enabled && !target) throw new Error("尚未选择目标页面");
+        if (message.enabled && !target) throw new Error("尚未选择控制目标");
+        if (message.enabled) {
+          try {
+            await target.activate();
+          } catch (error) {
+            armed = false;
+            reply(socket, { type: "control-state", enabled: false });
+            throw error;
+          }
+        }
         armed = Boolean(message.enabled);
         await target?.setLocalInputLocked(Boolean(calibration) || (armed && remoteTurn));
         reply(socket, { type: "control-state", enabled: armed });
@@ -361,12 +444,20 @@ wss.on("connection", (socket) => {
         return;
       }
       if (message.type === "start-calibration") {
-        if (!target) throw new Error("尚未选择目标页面");
+        if (!target) throw new Error("尚未选择控制目标");
         armed = false;
+        reply(socket, { type: "control-state", enabled: false });
+        await target.setLocalInputLocked(false);
+        await target.activate();
+        if (target instanceof NativeWindowTarget) {
+          calibration = null;
+          coordinateMap = { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
+          reply(socket, { type: "calibration-state", state: "complete", automatic: true });
+          return;
+        }
         calibration = { samples: [] };
         await target.setLocalInputLocked(true);
         coordinateMap = { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
-        reply(socket, { type: "control-state", enabled: false });
         await showCalibrationPoint(0);
         reply(socket, { type: "calibration-state", state: "point-1" });
         return;
@@ -392,7 +483,7 @@ wss.on("connection", (socket) => {
         try { await target?.setLocalInputLocked(false); } catch { /* Keep the original error. */ }
         reply(socket, { type: "calibration-state", state: "off" });
       }
-      reply(socket, { type: "input-error", message: error.message });
+      reply(socket, { type: "input-error", operation: message.type, message: error.message });
     }
   });
   socket.on("close", () => {
@@ -411,6 +502,7 @@ async function shutdown() {
   target = null;
   await releaseTarget(previousTarget);
   for (const socket of wss.clients) socket.close();
+  nativeHost.close();
   wss.close();
   process.exit(0);
 }
@@ -421,11 +513,11 @@ let announced = false;
 function announce() {
   if (announced) return;
   announced = true;
-  console.log("\nMutiny Relay Chromium 页面控制助手已启动");
+  console.log("\nMutiny Relay 应用控制助手已启动");
   console.log(`控制入口仅监听：ws://127.0.0.1:${companionPort}`);
   console.log(`Chromium 调试接口：${cdpBase.origin}`);
   console.log(`本次授权码：${code}`);
-  console.log("它不会移动系统鼠标，只会向你在房主页面中选定的标签页发送 CDP 输入事件。\n");
+  console.log("浏览器目标使用 CDP；Windows 应用目标会移动系统鼠标，并且只在房主显式启用后接收事件。\n");
 }
 wss.on("listening", announce);
 if (wss.address()) queueMicrotask(announce);
