@@ -115,6 +115,11 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(page, /近 2 秒丢包/);
   assert.match(page, /视频传输档位/);
   assert.match(page, /maxBitrate/);
+  assert.match(page, /3_500_000/);
+  assert.match(page, /preferH264Video/);
+  assert.match(page, /setCodecPreferences/);
+  assert.match(page, /freezeCount/);
+  assert.match(page, /nackCount/);
   assert.match(page, /jitterBufferMinimumDelay/);
   assert.match(page, /jitterBufferTargetDelay/);
   assert.match(page, /totalDecodeTime/);
