@@ -60,7 +60,7 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(signal, /reset-control-for-share/);
   assert.match(page, /contentHint\s*=\s*["']motion["']/);
   assert.match(page, /degradationPreference\s*=\s*["']maintain-framerate["']/);
-  assert.match(page, /maxFramerate\s*=\s*30/);
+  assert.match(page, /maxFramerate\s*=\s*profile\.frameRate/);
   assert.match(page, /approve-peer/);
   assert.match(page, /getStats/);
   assert.match(page, /createDataChannel\("controls", \{ ordered: true \}\)/);
@@ -113,6 +113,11 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(page, /共享系统音频/);
   assert.match(page, /audio:\s*includeAudio/);
   assert.match(page, /近 2 秒丢包/);
+  assert.match(page, /视频传输档位/);
+  assert.match(page, /maxBitrate/);
+  assert.match(page, /jitterBufferMinimumDelay/);
+  assert.match(page, /jitterBufferTargetDelay/);
+  assert.match(page, /totalDecodeTime/);
   assert.match(styles, /-webkit-touch-callout:none/);
   assert.match(page, /react-simple-keyboard/);
   assert.match(page, /onKeyReleased/);

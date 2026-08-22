@@ -11,13 +11,21 @@ type PeerRole = "controller" | "spectator";
 type Peer = { peerId: string; name: string; role: PeerRole; approved: boolean };
 type RemoteEvent = { type: "pointer" | "pointer-down" | "pointer-up" | "click" | "key" | "key-down" | "key-up" | "text"; x?: number; y?: number; button?: number; buttons?: number; key?: string; code?: string; keyCode?: number; location?: number; repeat?: boolean; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; text?: string };
 type ControlTarget = { id: string; title: string; url: string; kind: "browser" | "window"; width?: number; height?: number };
-type Quality = { rtt: number | null; videoDelay: number | null; jitterBuffer: number | null; bitrate: number; fps: number | null; lost: number };
+type Quality = { rtt: number | null; videoDelay: number | null; jitterBuffer: number | null; jitterBufferMinimum: number | null; jitterBufferTarget: number | null; decodeTime: number | null; bitrate: number; fps: number | null; lost: number };
+type VideoProfileKey = "low-latency" | "smooth" | "quality";
+type VideoProfile = { label: string; detail: string; width: number; height: number; frameRate: number; maxBitrate: number };
 type IceServerMessage = { type: "ice-servers"; iceServers: RTCIceServer[]; turnEnabled: boolean; error?: string | null };
 type ControlState = { ownerPeerId: string; ownerName: string; mode: "free"; calibrationReady: boolean; calibrationStep: "off" | "point-1" | "point-2" | "complete"; calibrationMessage: string | null; phase: "setup" | "calibration" | "ready" | "playing"; leaseUntil: number };
 type WebRtcVideoFrameMetadata = VideoFrameCallbackMetadata & { captureTime?: number; receiveTime?: number };
 type LowLatencyReceiver = RTCRtpReceiver & { jitterBufferTarget?: number | null; playoutDelayHint?: number | null };
 
 const configuredSignalUrl = process.env.NEXT_PUBLIC_SIGNAL_URL;
+const videoProfiles: Record<VideoProfileKey, VideoProfile> = {
+  "low-latency": { label: "低延迟", detail: "720p · 30 fps · 最高 2.5 Mbps", width: 1280, height: 720, frameRate: 30, maxBitrate: 2_500_000 },
+  smooth: { label: "高帧率", detail: "720p · 60 fps · 最高 5 Mbps", width: 1280, height: 720, frameRate: 60, maxBitrate: 5_000_000 },
+  quality: { label: "高清晰度", detail: "1080p · 30 fps · 最高 6 Mbps", width: 1920, height: 1080, frameRate: 30, maxBitrate: 6_000_000 },
+};
+
 
 type VirtualKey = { key: string; code: string; keyCode: number; shiftKey?: boolean };
 
@@ -123,10 +131,11 @@ function defaultRtcConfig(): RTCConfiguration {
   return { iceServers };
 }
 
-async function preferSmoothVideo(sender: RTCRtpSender) {
+async function preferSmoothVideo(sender: RTCRtpSender, profile: VideoProfile) {
   const parameters = sender.getParameters();
   if (!parameters.encodings.length) parameters.encodings = [{}];
-  parameters.encodings[0].maxFramerate = 30;
+  parameters.encodings[0].maxFramerate = profile.frameRate;
+  parameters.encodings[0].maxBitrate = profile.maxBitrate;
   (parameters as RTCRtpSendParameters & { degradationPreference?: "maintain-framerate" }).degradationPreference = "maintain-framerate";
   try {
     await sender.setParameters(parameters);
@@ -149,9 +158,9 @@ function preferLowLatencyPlayback(receiver: RTCRtpReceiver) {
   }
 }
 
-async function selectDisplayStream(includeAudio: boolean) {
+async function selectDisplayStream(includeAudio: boolean, profile: VideoProfile) {
   const stream = await navigator.mediaDevices.getDisplayMedia({
-    video: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 1920 }, displaySurface: "window" },
+    video: { frameRate: { ideal: profile.frameRate, max: profile.frameRate }, width: { ideal: profile.width, max: profile.width }, height: { ideal: profile.height, max: profile.height }, displaySurface: "window" },
     audio: includeAudio,
   });
   const videoTrack = stream.getVideoTracks()[0];
@@ -161,7 +170,7 @@ async function selectDisplayStream(includeAudio: boolean) {
   }
   try {
     videoTrack.contentHint = "motion";
-    await videoTrack.applyConstraints({ frameRate: { ideal: 30, max: 30 } });
+    await videoTrack.applyConstraints({ frameRate: { ideal: profile.frameRate, max: profile.frameRate }, width: { ideal: profile.width, max: profile.width }, height: { ideal: profile.height, max: profile.height } });
     return stream;
   } catch (error) {
     stream.getTracks().forEach((track) => track.stop());
@@ -175,12 +184,13 @@ export default function RelayRoom() {
   const [requestedRole, setRequestedRole] = useState<PeerRole>("controller");
   const [name, setName] = useState("");
   const [shareAudio, setShareAudio] = useState(false);
+  const [videoProfile, setVideoProfile] = useState<VideoProfileKey>("low-latency");
   const [joinCode, setJoinCode] = useState("");
   const [roomCode, setRoomCode] = useState("");
   const [status, setStatus] = useState("本地服务未连接");
   const [notice, setNotice] = useState("");
   const [peers, setPeers] = useState<Peer[]>([]);
-  const [quality, setQuality] = useState<Quality>({ rtt: null, videoDelay: null, jitterBuffer: null, bitrate: 0, fps: null, lost: 0 });
+  const [quality, setQuality] = useState<Quality>({ rtt: null, videoDelay: null, jitterBuffer: null, jitterBufferMinimum: null, jitterBufferTarget: null, decodeTime: null, bitrate: 0, fps: null, lost: 0 });
   const [videoAspect, setVideoAspect] = useState(16 / 9);
   const [remotePointer, setRemotePointer] = useState({ x: 0.5, y: 0.5, visible: false, click: false });
   const [lastCommand, setLastCommand] = useState("等待访客操作");
@@ -217,7 +227,7 @@ export default function RelayRoom() {
   const desktopControlEnabledRef = useRef(false);
   const calibrationActiveRef = useRef(false);
   const videoViewportRef = useRef<HTMLDivElement | null>(null);
-  const statsPreviousRef = useRef(new Map<string, { bytes: number; at: number; jitterDelay: number; jitterCount: number; lost: number }>());
+  const statsPreviousRef = useRef(new Map<string, { bytes: number; at: number; jitterDelay: number; jitterMinimumDelay: number | null; jitterTargetDelay: number | null; jitterCount: number; decodeTime: number | null; decodedFrames: number; lost: number }>());
   const videoDelayRef = useRef<number | null>(null);
   const pointerAtRef = useRef(0);
   const rtcConfigRef = useRef<RTCConfiguration>(defaultRtcConfig());
@@ -325,14 +335,14 @@ export default function RelayRoom() {
     const pc = new RTCPeerConnection(rtcConfigRef.current);
     bindPeer(peerId, pc);
     const senders = streamRef.current.getTracks().map((track) => pc.addTrack(track, streamRef.current!));
-    await Promise.all(senders.filter((sender) => sender.track?.kind === "video").map(preferSmoothVideo));
+    await Promise.all(senders.filter((sender) => sender.track?.kind === "video").map((sender) => preferSmoothVideo(sender, videoProfiles[videoProfile])));
     // Keyboard and mouse button transitions must arrive in order. Losing a key-up
     // leaves games thinking the key is held and makes later presses appear inert.
     const channel = pc.createDataChannel("controls", { ordered: true });
     bindChannel(peerId, channel);
     await pc.setLocalDescription(await pc.createOffer());
     sendSignal({ type: "signal", target: peerId, data: { description: pc.localDescription } });
-  }, [bindChannel, bindPeer, sendSignal]);
+  }, [bindChannel, bindPeer, sendSignal, videoProfile]);
 
   const ensureGuestPeer = useCallback((hostId: string) => {
     const existing = pcsRef.current.get(hostId);
@@ -464,7 +474,7 @@ export default function RelayRoom() {
   const createRoom = async () => {
     setNotice("");
     try {
-      const stream = await selectDisplayStream(shareAudio);
+      const stream = await selectDisplayStream(shareAudio, videoProfiles[videoProfile]);
       const videoTrack = stream.getVideoTracks()[0];
       streamRef.current = stream;
       videoTrack.onended = () => setStatus("屏幕分享已停止");
@@ -486,7 +496,7 @@ export default function RelayRoom() {
     let nextStream: MediaStream | null = null;
     const replacements: Array<{ sender: RTCRtpSender; previous: MediaStreamTrack | null }> = [];
     try {
-      nextStream = await selectDisplayStream(shareAudio);
+      nextStream = await selectDisplayStream(shareAudio, videoProfiles[videoProfile]);
       const previousStream = streamRef.current;
       if (!previousStream) throw new Error("当前没有可替换的共享画面");
       const nextVideoTrack = nextStream.getVideoTracks()[0];
@@ -502,7 +512,7 @@ export default function RelayRoom() {
         if (!videoSender) throw new Error("当前连接缺少可替换的视频发送轨道");
         replacements.push({ sender: videoSender, previous: videoSender.track });
         await videoSender.replaceTrack(nextVideoTrack);
-        await preferSmoothVideo(videoSender);
+        await preferSmoothVideo(videoSender, videoProfiles[videoProfile]);
 
         const audioSender = pc.getTransceivers()
           .find((transceiver) => transceiver.sender.track?.kind === "audio" || transceiver.receiver.track.kind === "audio")
@@ -899,17 +909,21 @@ export default function RelayRoom() {
     if (!role) return;
     const timer = window.setInterval(async () => {
       const entry = [...pcsRef.current.entries()][0];
-      if (!entry) return setQuality({ rtt: null, videoDelay: null, jitterBuffer: null, bitrate: 0, fps: null, lost: 0 });
+      if (!entry) return setQuality({ rtt: null, videoDelay: null, jitterBuffer: null, jitterBufferMinimum: null, jitterBufferTarget: null, decodeTime: null, bitrate: 0, fps: null, lost: 0 });
       const [peerId, pc] = entry;
       const reports = await pc.getStats();
       let bytes = 0, fps: number | null = null, lost = 0, rtt: number | null = null;
-      let jitterDelay = 0, jitterCount = 0;
+      let jitterDelay = 0, jitterCount = 0, decodedFrames = 0;
+      let jitterMinimumDelay: number | null = null, jitterTargetDelay: number | null = null, decodeTime: number | null = null;
       let selectedPair;
       reports.forEach((report) => {
         if ((report.type === "inbound-rtp" || report.type === "outbound-rtp") && report.kind === "video") {
           bytes += report.bytesReceived ?? report.bytesSent ?? 0; fps = report.framesPerSecond ?? fps; lost += report.packetsLost ?? 0;
           if (report.type === "inbound-rtp") {
             jitterDelay += report.jitterBufferDelay ?? 0; jitterCount += report.jitterBufferEmittedCount ?? 0;
+            if (typeof report.jitterBufferMinimumDelay === "number") jitterMinimumDelay = (jitterMinimumDelay ?? 0) + report.jitterBufferMinimumDelay;
+            if (typeof report.jitterBufferTargetDelay === "number") jitterTargetDelay = (jitterTargetDelay ?? 0) + report.jitterBufferTargetDelay;
+            if (typeof report.totalDecodeTime === "number") decodeTime = (decodeTime ?? 0) + report.totalDecodeTime; decodedFrames += report.framesDecoded ?? 0;
           }
         }
         if (report.type === "candidate-pair" && report.state === "succeeded" && (report.nominated || report.selected)) {
@@ -927,8 +941,12 @@ export default function RelayRoom() {
       const emitted = previous ? jitterCount - previous.jitterCount : 0;
       const recentLost = previous ? Math.max(0, lost - previous.lost) : 0;
       const jitterBuffer = previous && emitted > 0 ? Math.max(0, Math.round(((jitterDelay - previous.jitterDelay) / emitted) * 1000)) : null;
-      statsPreviousRef.current.set(peerId, { bytes, at: now, jitterDelay, jitterCount, lost });
-      setQuality({ rtt, videoDelay: role === "guest" ? videoDelayRef.current : null, jitterBuffer, bitrate, fps, lost: recentLost });
+      const jitterBufferMinimum = previous && emitted > 0 && jitterMinimumDelay != null && previous.jitterMinimumDelay != null ? Math.max(0, Math.round(((jitterMinimumDelay - previous.jitterMinimumDelay) / emitted) * 1000)) : null;
+      const jitterBufferTarget = previous && emitted > 0 && jitterTargetDelay != null && previous.jitterTargetDelay != null ? Math.max(0, Math.round(((jitterTargetDelay - previous.jitterTargetDelay) / emitted) * 1000)) : null;
+      const frames = previous ? decodedFrames - previous.decodedFrames : 0;
+      const averageDecodeTime = previous && frames > 0 && decodeTime != null && previous.decodeTime != null ? Math.max(0, Math.round(((decodeTime - previous.decodeTime) / frames) * 1000)) : null;
+      statsPreviousRef.current.set(peerId, { bytes, at: now, jitterDelay, jitterMinimumDelay, jitterTargetDelay, jitterCount, decodeTime, decodedFrames, lost });
+      setQuality({ rtt, videoDelay: role === "guest" ? videoDelayRef.current : null, jitterBuffer, jitterBufferMinimum, jitterBufferTarget, decodeTime: averageDecodeTime, bitrate, fps, lost: recentLost });
     }, 2000);
     return () => window.clearInterval(timer);
   }, [role]);
@@ -960,6 +978,12 @@ export default function RelayRoom() {
         <h1>通用同屏，<br />自由协作</h1>
         <p>获准操作者可以控制选定的浏览器页面、Windows 应用窗口或共享屏幕。</p>
         <input className="nameInput" value={name} onChange={(event) => setName(event.target.value)} placeholder="你的昵称（可选）" maxLength={24} />
+        <div className="streamProfileOption">
+          <label htmlFor="video-profile"><strong>视频传输档位</strong><small>{videoProfiles[videoProfile].detail}；码率为上限，网络拥塞时仍会自动降低</small></label>
+          <select id="video-profile" value={videoProfile} onChange={(event) => setVideoProfile(event.target.value as VideoProfileKey)}>
+            {(Object.entries(videoProfiles) as Array<[VideoProfileKey, VideoProfile]>).map(([key, profile]) => <option key={key} value={key}>{profile.label}</option>)}
+          </select>
+        </div>
         <div className="audioShareOption">
           <input id="share-system-audio" type="checkbox" checked={shareAudio} onChange={(event) => setShareAudio(event.target.checked)} />
           <label htmlFor="share-system-audio"><strong>共享系统音频</strong><small>默认关闭以减少音视频同步缓冲；需要声音时再开启</small></label>
@@ -978,7 +1002,7 @@ export default function RelayRoom() {
     {role && <section className="workspace">
       <div className="workspaceTitle"><div><span className="rolePill">{role === "host" ? "房主" : peerRole === "controller" ? "远端操作者" : "观众"}</span><h1>{role === "host" ? `房间 ${roomCode || "······"}` : `加入 ${roomCode || joinCode}`}</h1></div><button className="textButton" onClick={role === "host" ? closeHostedRoom : reset}>{role === "host" ? "关闭房间" : "退出房间"}</button></div>
       <div className="connectionBar"><span className={connected ? "dot online" : "dot"} />{status}<span className="secure">{connectedPeers} 个连接 · {turnStatus} · {mediaPath} · DTLS / SRTP</span></div>
-      <div className="qualityBar"><div><span>网络 RTT</span><strong>{quality.rtt == null ? "—" : `${quality.rtt} ms`}</strong></div><div className="videoDelayMetric"><span>画面延迟</span><strong>{quality.videoDelay == null ? "—" : `${quality.videoDelay} ms`}</strong><small>{quality.jitterBuffer == null ? "缓冲 —" : `缓冲 ${quality.jitterBuffer} ms`}</small></div><div><span>视频码率</span><strong>{quality.bitrate ? `${quality.bitrate} kbps` : "—"}</strong></div><div><span>帧率</span><strong>{quality.fps == null ? "—" : `${Math.round(quality.fps)} fps`}</strong></div><div><span>近 2 秒丢包</span><strong>{quality.lost}</strong></div></div>
+      <div className="qualityBar"><div><span>网络 RTT</span><strong>{quality.rtt == null ? "—" : `${quality.rtt} ms`}</strong></div><div className="videoDelayMetric" title="精确值依赖浏览器提供 captureTime；不支持时以接收缓冲作为可确认的延迟下限"><span>画面延迟</span><strong>{quality.videoDelay != null ? `${quality.videoDelay} ms` : quality.jitterBuffer != null ? `≥ ${quality.jitterBuffer} ms` : "—"}</strong><small>{quality.jitterBuffer == null ? "缓冲 —" : `缓冲 ${quality.jitterBuffer} · 最低 ${quality.jitterBufferMinimum ?? "—"} · 目标 ${quality.jitterBufferTarget ?? "—"} · 解码 ${quality.decodeTime ?? "—"} ms`}</small></div><div><span>视频码率</span><strong>{quality.bitrate ? `${quality.bitrate} kbps` : "—"}</strong></div><div><span>帧率</span><strong>{quality.fps == null ? "—" : `${Math.round(quality.fps)} fps`}</strong></div><div><span>近 2 秒丢包</span><strong>{quality.lost}</strong></div></div>
       <div className="grid">
         <div>
           <div className="stage videoStage">
