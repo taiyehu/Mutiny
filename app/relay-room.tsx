@@ -138,17 +138,21 @@ async function preferSmoothVideo(sender: RTCRtpSender) {
 function preferLowLatencyPlayback(receiver: RTCRtpReceiver) {
   const configurable = receiver as LowLatencyReceiver;
   try {
-    if ("jitterBufferTarget" in configurable) configurable.jitterBufferTarget = 0;
+    if ("jitterBufferTarget" in configurable) configurable.jitterBufferTarget = 20;
+  } catch (error) {
+    console.warn("无法设置标准接收缓冲目标，将继续尝试浏览器兼容接口。", error);
+  }
+  try {
     if ("playoutDelayHint" in configurable) configurable.playoutDelayHint = 0;
   } catch (error) {
-    console.warn("无法调整接收端播放缓冲，将继续使用浏览器默认值。", error);
+    console.warn("无法设置兼容播放延迟提示，将继续使用浏览器默认值。", error);
   }
 }
 
-async function selectDisplayStream() {
+async function selectDisplayStream(includeAudio: boolean) {
   const stream = await navigator.mediaDevices.getDisplayMedia({
     video: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 1920 }, displaySurface: "window" },
-    audio: true,
+    audio: includeAudio,
   });
   const videoTrack = stream.getVideoTracks()[0];
   if (!videoTrack) {
@@ -170,6 +174,7 @@ export default function RelayRoom() {
   const [peerRole, setPeerRole] = useState<PeerRole>("controller");
   const [requestedRole, setRequestedRole] = useState<PeerRole>("controller");
   const [name, setName] = useState("");
+  const [shareAudio, setShareAudio] = useState(false);
   const [joinCode, setJoinCode] = useState("");
   const [roomCode, setRoomCode] = useState("");
   const [status, setStatus] = useState("本地服务未连接");
@@ -212,7 +217,7 @@ export default function RelayRoom() {
   const desktopControlEnabledRef = useRef(false);
   const calibrationActiveRef = useRef(false);
   const videoViewportRef = useRef<HTMLDivElement | null>(null);
-  const statsPreviousRef = useRef(new Map<string, { bytes: number; at: number; jitterDelay: number; jitterCount: number }>());
+  const statsPreviousRef = useRef(new Map<string, { bytes: number; at: number; jitterDelay: number; jitterCount: number; lost: number }>());
   const videoDelayRef = useRef<number | null>(null);
   const pointerAtRef = useRef(0);
   const rtcConfigRef = useRef<RTCConfiguration>(defaultRtcConfig());
@@ -459,7 +464,7 @@ export default function RelayRoom() {
   const createRoom = async () => {
     setNotice("");
     try {
-      const stream = await selectDisplayStream();
+      const stream = await selectDisplayStream(shareAudio);
       const videoTrack = stream.getVideoTracks()[0];
       streamRef.current = stream;
       videoTrack.onended = () => setStatus("屏幕分享已停止");
@@ -481,7 +486,7 @@ export default function RelayRoom() {
     let nextStream: MediaStream | null = null;
     const replacements: Array<{ sender: RTCRtpSender; previous: MediaStreamTrack | null }> = [];
     try {
-      nextStream = await selectDisplayStream();
+      nextStream = await selectDisplayStream(shareAudio);
       const previousStream = streamRef.current;
       if (!previousStream) throw new Error("当前没有可替换的共享画面");
       const nextVideoTrack = nextStream.getVideoTracks()[0];
@@ -920,9 +925,10 @@ export default function RelayRoom() {
       const now = performance.now(); const previous = statsPreviousRef.current.get(peerId);
       const bitrate = previous ? Math.max(0, Math.round(((bytes - previous.bytes) * 8) / ((now - previous.at) / 1000) / 1000)) : 0;
       const emitted = previous ? jitterCount - previous.jitterCount : 0;
+      const recentLost = previous ? Math.max(0, lost - previous.lost) : 0;
       const jitterBuffer = previous && emitted > 0 ? Math.max(0, Math.round(((jitterDelay - previous.jitterDelay) / emitted) * 1000)) : null;
-      statsPreviousRef.current.set(peerId, { bytes, at: now, jitterDelay, jitterCount });
-      setQuality({ rtt, videoDelay: role === "guest" ? videoDelayRef.current : null, jitterBuffer, bitrate, fps, lost });
+      statsPreviousRef.current.set(peerId, { bytes, at: now, jitterDelay, jitterCount, lost });
+      setQuality({ rtt, videoDelay: role === "guest" ? videoDelayRef.current : null, jitterBuffer, bitrate, fps, lost: recentLost });
     }, 2000);
     return () => window.clearInterval(timer);
   }, [role]);
@@ -954,6 +960,10 @@ export default function RelayRoom() {
         <h1>通用同屏，<br />自由协作</h1>
         <p>获准操作者可以控制选定的浏览器页面、Windows 应用窗口或共享屏幕。</p>
         <input className="nameInput" value={name} onChange={(event) => setName(event.target.value)} placeholder="你的昵称（可选）" maxLength={24} />
+        <div className="audioShareOption">
+          <input id="share-system-audio" type="checkbox" checked={shareAudio} onChange={(event) => setShareAudio(event.target.checked)} />
+          <label htmlFor="share-system-audio"><strong>共享系统音频</strong><small>默认关闭以减少音视频同步缓冲；需要声音时再开启</small></label>
+        </div>
         <div className="actions"><button className="primary" onClick={createRoom}>分享屏幕并创建房间</button></div>
         <div className="joinBox">
           <input aria-label="房间码" value={joinCode} onChange={(event) => setJoinCode(event.target.value.toUpperCase().replace(/[^2-9A-Z]/g, "").slice(0, 6))} placeholder="输入 6 位房间码" maxLength={6} />
@@ -968,7 +978,7 @@ export default function RelayRoom() {
     {role && <section className="workspace">
       <div className="workspaceTitle"><div><span className="rolePill">{role === "host" ? "房主" : peerRole === "controller" ? "远端操作者" : "观众"}</span><h1>{role === "host" ? `房间 ${roomCode || "······"}` : `加入 ${roomCode || joinCode}`}</h1></div><button className="textButton" onClick={role === "host" ? closeHostedRoom : reset}>{role === "host" ? "关闭房间" : "退出房间"}</button></div>
       <div className="connectionBar"><span className={connected ? "dot online" : "dot"} />{status}<span className="secure">{connectedPeers} 个连接 · {turnStatus} · {mediaPath} · DTLS / SRTP</span></div>
-      <div className="qualityBar"><div><span>网络 RTT</span><strong>{quality.rtt == null ? "—" : `${quality.rtt} ms`}</strong></div><div className="videoDelayMetric"><span>画面延迟</span><strong>{quality.videoDelay == null ? "—" : `${quality.videoDelay} ms`}</strong><small>{quality.jitterBuffer == null ? "缓冲 —" : `缓冲 ${quality.jitterBuffer} ms`}</small></div><div><span>视频码率</span><strong>{quality.bitrate ? `${quality.bitrate} kbps` : "—"}</strong></div><div><span>帧率</span><strong>{quality.fps == null ? "—" : `${Math.round(quality.fps)} fps`}</strong></div><div><span>丢包</span><strong>{quality.lost}</strong></div></div>
+      <div className="qualityBar"><div><span>网络 RTT</span><strong>{quality.rtt == null ? "—" : `${quality.rtt} ms`}</strong></div><div className="videoDelayMetric"><span>画面延迟</span><strong>{quality.videoDelay == null ? "—" : `${quality.videoDelay} ms`}</strong><small>{quality.jitterBuffer == null ? "缓冲 —" : `缓冲 ${quality.jitterBuffer} ms`}</small></div><div><span>视频码率</span><strong>{quality.bitrate ? `${quality.bitrate} kbps` : "—"}</strong></div><div><span>帧率</span><strong>{quality.fps == null ? "—" : `${Math.round(quality.fps)} fps`}</strong></div><div><span>近 2 秒丢包</span><strong>{quality.lost}</strong></div></div>
       <div className="grid">
         <div>
           <div className="stage videoStage">
