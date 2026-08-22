@@ -11,9 +11,11 @@ type PeerRole = "controller" | "spectator";
 type Peer = { peerId: string; name: string; role: PeerRole; approved: boolean };
 type RemoteEvent = { type: "pointer" | "pointer-down" | "pointer-up" | "click" | "key" | "key-down" | "key-up" | "text"; x?: number; y?: number; button?: number; buttons?: number; key?: string; code?: string; keyCode?: number; location?: number; repeat?: boolean; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; text?: string };
 type ControlTarget = { id: string; title: string; url: string; kind: "browser" | "window"; width?: number; height?: number };
-type Quality = { rtt: number | null; bitrate: number; fps: number | null; lost: number };
+type Quality = { rtt: number | null; videoDelay: number | null; jitterBuffer: number | null; bitrate: number; fps: number | null; lost: number };
 type IceServerMessage = { type: "ice-servers"; iceServers: RTCIceServer[]; turnEnabled: boolean; error?: string | null };
 type ControlState = { ownerPeerId: string; ownerName: string; mode: "free"; calibrationReady: boolean; calibrationStep: "off" | "point-1" | "point-2" | "complete"; calibrationMessage: string | null; phase: "setup" | "calibration" | "ready" | "playing"; leaseUntil: number };
+type WebRtcVideoFrameMetadata = VideoFrameCallbackMetadata & { captureTime?: number; receiveTime?: number };
+type LowLatencyReceiver = RTCRtpReceiver & { jitterBufferTarget?: number | null; playoutDelayHint?: number | null };
 
 const configuredSignalUrl = process.env.NEXT_PUBLIC_SIGNAL_URL;
 
@@ -133,6 +135,16 @@ async function preferSmoothVideo(sender: RTCRtpSender) {
   }
 }
 
+function preferLowLatencyPlayback(receiver: RTCRtpReceiver) {
+  const configurable = receiver as LowLatencyReceiver;
+  try {
+    if ("jitterBufferTarget" in configurable) configurable.jitterBufferTarget = 0;
+    if ("playoutDelayHint" in configurable) configurable.playoutDelayHint = 0;
+  } catch (error) {
+    console.warn("无法调整接收端播放缓冲，将继续使用浏览器默认值。", error);
+  }
+}
+
 async function selectDisplayStream() {
   const stream = await navigator.mediaDevices.getDisplayMedia({
     video: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 1920 }, displaySurface: "window" },
@@ -163,7 +175,7 @@ export default function RelayRoom() {
   const [status, setStatus] = useState("本地服务未连接");
   const [notice, setNotice] = useState("");
   const [peers, setPeers] = useState<Peer[]>([]);
-  const [quality, setQuality] = useState<Quality>({ rtt: null, bitrate: 0, fps: null, lost: 0 });
+  const [quality, setQuality] = useState<Quality>({ rtt: null, videoDelay: null, jitterBuffer: null, bitrate: 0, fps: null, lost: 0 });
   const [videoAspect, setVideoAspect] = useState(16 / 9);
   const [remotePointer, setRemotePointer] = useState({ x: 0.5, y: 0.5, visible: false, click: false });
   const [lastCommand, setLastCommand] = useState("等待访客操作");
@@ -200,7 +212,8 @@ export default function RelayRoom() {
   const desktopControlEnabledRef = useRef(false);
   const calibrationActiveRef = useRef(false);
   const videoViewportRef = useRef<HTMLDivElement | null>(null);
-  const statsPreviousRef = useRef(new Map<string, { bytes: number; at: number }>());
+  const statsPreviousRef = useRef(new Map<string, { bytes: number; at: number; jitterDelay: number; jitterCount: number }>());
+  const videoDelayRef = useRef<number | null>(null);
   const pointerAtRef = useRef(0);
   const rtcConfigRef = useRef<RTCConfiguration>(defaultRtcConfig());
   const turnEnabledRef = useRef(false);
@@ -288,6 +301,7 @@ export default function RelayRoom() {
       if (event.candidate) sendSignal({ type: "signal", target: peerId, data: { candidate: event.candidate.toJSON() } });
     };
     pc.ontrack = (event) => {
+      preferLowLatencyPlayback(event.receiver);
       if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0];
     };
     pc.onconnectionstatechange = () => {
@@ -346,6 +360,8 @@ export default function RelayRoom() {
     pcsRef.current.clear();
     channelsRef.current.clear();
     candidateQueueRef.current.clear();
+    statsPreviousRef.current.clear();
+    videoDelayRef.current = null;
     setConnectedPeers(0);
     setRemotePointer((old) => ({ ...old, visible: false, click: false }));
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
@@ -826,6 +842,8 @@ export default function RelayRoom() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     wsRef.current = null; companionRef.current = null; streamRef.current = null;
     pcsRef.current.clear(); channelsRef.current.clear(); candidateQueueRef.current.clear();
+    statsPreviousRef.current.clear();
+    videoDelayRef.current = null;
     peersRef.current = []; selfPeerIdRef.current = ""; controlRef.current = null; desktopControlEnabledRef.current = false; calibrationActiveRef.current = false; turnEnabledRef.current = false; rtcConfigRef.current = defaultRtcConfig(); pressedVirtualKeysRef.current.clear(); setKeyboardLayoutName("default"); setDesktopControlEnabled(false); setBrowserTargets([]); setBrowserTargetId(""); setBrowserTargetReady(false); setBrowserViewport(null); setCalibrationState("off"); setZoom(1); setRole(null); roleRef.current = null; setRoomCode(""); setSelfPeerId(""); setControl(null); setPeers([]); setConnectedPeers(0); setTurnStatus("正在检查 ICE"); setMediaPath("等待连接"); setStatus("本地服务未连接"); setNotice(""); setCompanionState("off");
   }, []);
 
@@ -845,17 +863,49 @@ export default function RelayRoom() {
   }, [control?.ownerPeerId, role, selfPeerId, sendSignal]);
 
   useEffect(() => {
+    if (role !== "guest") {
+      videoDelayRef.current = null;
+      return;
+    }
+    const video = remoteVideoRef.current;
+    if (!video || typeof video.requestVideoFrameCallback !== "function") return;
+    let active = true;
+    let callbackId = 0;
+    const measureFrameDelay = (now: number, metadata: VideoFrameCallbackMetadata) => {
+      const webRtcMetadata = metadata as WebRtcVideoFrameMetadata;
+      if (typeof webRtcMetadata.captureTime === "number") {
+        const sample = Math.round((metadata.expectedDisplayTime || now) - webRtcMetadata.captureTime);
+        if (Number.isFinite(sample) && sample >= 0 && sample < 10_000) {
+          const previous = videoDelayRef.current;
+          videoDelayRef.current = previous == null ? sample : Math.round(previous * 0.8 + sample * 0.2);
+        }
+      }
+      if (active) callbackId = video.requestVideoFrameCallback(measureFrameDelay);
+    };
+    callbackId = video.requestVideoFrameCallback(measureFrameDelay);
+    return () => {
+      active = false;
+      video.cancelVideoFrameCallback(callbackId);
+      videoDelayRef.current = null;
+    };
+  }, [role]);
+
+  useEffect(() => {
     if (!role) return;
     const timer = window.setInterval(async () => {
       const entry = [...pcsRef.current.entries()][0];
-      if (!entry) return setQuality({ rtt: null, bitrate: 0, fps: null, lost: 0 });
+      if (!entry) return setQuality({ rtt: null, videoDelay: null, jitterBuffer: null, bitrate: 0, fps: null, lost: 0 });
       const [peerId, pc] = entry;
       const reports = await pc.getStats();
       let bytes = 0, fps: number | null = null, lost = 0, rtt: number | null = null;
+      let jitterDelay = 0, jitterCount = 0;
       let selectedPair;
       reports.forEach((report) => {
         if ((report.type === "inbound-rtp" || report.type === "outbound-rtp") && report.kind === "video") {
           bytes += report.bytesReceived ?? report.bytesSent ?? 0; fps = report.framesPerSecond ?? fps; lost += report.packetsLost ?? 0;
+          if (report.type === "inbound-rtp") {
+            jitterDelay += report.jitterBufferDelay ?? 0; jitterCount += report.jitterBufferEmittedCount ?? 0;
+          }
         }
         if (report.type === "candidate-pair" && report.state === "succeeded" && (report.nominated || report.selected)) {
           selectedPair = report;
@@ -869,8 +919,10 @@ export default function RelayRoom() {
       }
       const now = performance.now(); const previous = statsPreviousRef.current.get(peerId);
       const bitrate = previous ? Math.max(0, Math.round(((bytes - previous.bytes) * 8) / ((now - previous.at) / 1000) / 1000)) : 0;
-      statsPreviousRef.current.set(peerId, { bytes, at: now });
-      setQuality({ rtt, bitrate, fps, lost });
+      const emitted = previous ? jitterCount - previous.jitterCount : 0;
+      const jitterBuffer = previous && emitted > 0 ? Math.max(0, Math.round(((jitterDelay - previous.jitterDelay) / emitted) * 1000)) : null;
+      statsPreviousRef.current.set(peerId, { bytes, at: now, jitterDelay, jitterCount });
+      setQuality({ rtt, videoDelay: role === "guest" ? videoDelayRef.current : null, jitterBuffer, bitrate, fps, lost });
     }, 2000);
     return () => window.clearInterval(timer);
   }, [role]);
@@ -916,7 +968,7 @@ export default function RelayRoom() {
     {role && <section className="workspace">
       <div className="workspaceTitle"><div><span className="rolePill">{role === "host" ? "房主" : peerRole === "controller" ? "远端操作者" : "观众"}</span><h1>{role === "host" ? `房间 ${roomCode || "······"}` : `加入 ${roomCode || joinCode}`}</h1></div><button className="textButton" onClick={role === "host" ? closeHostedRoom : reset}>{role === "host" ? "关闭房间" : "退出房间"}</button></div>
       <div className="connectionBar"><span className={connected ? "dot online" : "dot"} />{status}<span className="secure">{connectedPeers} 个连接 · {turnStatus} · {mediaPath} · DTLS / SRTP</span></div>
-      <div className="qualityBar"><div><span>延迟</span><strong>{quality.rtt == null ? "—" : `${quality.rtt} ms`}</strong></div><div><span>视频码率</span><strong>{quality.bitrate ? `${quality.bitrate} kbps` : "—"}</strong></div><div><span>帧率</span><strong>{quality.fps == null ? "—" : `${Math.round(quality.fps)} fps`}</strong></div><div><span>丢包</span><strong>{quality.lost}</strong></div></div>
+      <div className="qualityBar"><div><span>网络 RTT</span><strong>{quality.rtt == null ? "—" : `${quality.rtt} ms`}</strong></div><div className="videoDelayMetric"><span>画面延迟</span><strong>{quality.videoDelay == null ? "—" : `${quality.videoDelay} ms`}</strong><small>{quality.jitterBuffer == null ? "缓冲 —" : `缓冲 ${quality.jitterBuffer} ms`}</small></div><div><span>视频码率</span><strong>{quality.bitrate ? `${quality.bitrate} kbps` : "—"}</strong></div><div><span>帧率</span><strong>{quality.fps == null ? "—" : `${Math.round(quality.fps)} fps`}</strong></div><div><span>丢包</span><strong>{quality.lost}</strong></div></div>
       <div className="grid">
         <div>
           <div className="stage videoStage">
@@ -937,7 +989,7 @@ export default function RelayRoom() {
                 {role === "host" && remotePointer.visible && <div className={`remoteCursor ${remotePointer.click ? "clicking" : ""}`} style={{ left: `${remotePointer.x * 100}%`, top: `${remotePointer.y * 100}%` }}><span>远程</span></div>}
                 {role === "guest" && !connected && <div className="videoPlaceholder"><div className="radar"><span>◎</span></div><strong>{status}</strong><small>连接建立后画面会自动出现</small></div>}
               </div>
-              {role === "guest" && <div className={`mobileControlOverlay ${canGuestControl ? "" : "disabled"} ${mobileKeyboardOpen || mobileKeyEditorOpen ? "panelOpen" : ""}`} aria-label="悬浮触屏控制">
+              {role === "guest" && <div className={`mobileControlOverlay ${canGuestControl ? "" : "disabled"} ${mobileKeyboardOpen || mobileKeyEditorOpen ? "panelOpen" : ""}`} aria-label="悬浮触屏控制" onContextMenu={(event) => event.preventDefault()} onDragStart={(event) => event.preventDefault()}>
                 <div className="mobileControlToolbar">
                   <button type="button" aria-expanded={mobileKeyboardOpen} onClick={() => { setMobileKeyboardOpen((open) => !open); setMobileKeyEditorOpen(false); }}>⌨ 键盘</button>
                   <button type="button" aria-expanded={mobileKeyEditorOpen} onClick={() => { setMobileKeyEditorOpen((open) => !open); setMobileKeyboardOpen(false); }}>⚙ 按键</button>

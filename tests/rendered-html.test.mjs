@@ -105,6 +105,12 @@ test("本地联机组件与配置齐全", async () => {
   assert.ok(page.indexOf("mobileControlOverlay") < page.indexOf('className="commandLog"'));
   assert.match(styles, /\.videoViewport:fullscreen/);
   assert.match(styles, /\.mobileControlOverlay/);
+  assert.match(page, /jitterBufferTarget\s*=\s*0/);
+  assert.match(page, /requestVideoFrameCallback/);
+  assert.match(page, /captureTime/);
+  assert.match(page, /画面延迟/);
+  assert.match(page, /onContextMenu/);
+  assert.match(styles, /-webkit-touch-callout:none/);
   assert.match(page, /react-simple-keyboard/);
   assert.match(page, /onKeyReleased/);
   assert.match(page, /TURN 已就绪/);
