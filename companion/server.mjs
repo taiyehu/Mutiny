@@ -28,6 +28,7 @@ let calibration = null;
 let coordinateMap = { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
 let captureInfo = { surface: "window", width: 0, height: 0 };
 const nativeHost = new WindowsNativeHost();
+const pressedKeys = new Map();
 
 function reply(socket, message) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
@@ -176,6 +177,7 @@ class NativeWindowTarget {
 
 async function releaseTarget(instance) {
   if (!instance) return;
+  await releasePressedKeys(instance);
   try { await instance.setLocalInputLocked(false); } catch { /* A closing target may no longer accept CDP commands. */ }
   instance.close();
 }
@@ -185,88 +187,139 @@ function modifierMask(message) {
     (message.metaKey ? 4 : 0) | (message.shiftKey ? 8 : 0);
 }
 
-function virtualKey(key) {
+function virtualKey(message) {
+  const supplied = Number(message.keyCode);
+  if (Number.isInteger(supplied) && supplied > 0 && supplied < 256) return supplied;
+  const key = String(message.key || "");
   const named = {
     Backspace: 8, Tab: 9, Enter: 13, Shift: 16, Control: 17, Alt: 18,
-    Escape: 27, " ": 32, PageUp: 33, PageDown: 34, End: 35, Home: 36,
-    ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Delete: 46,
+    Pause: 19, CapsLock: 20, Escape: 27, " ": 32, PageUp: 33, PageDown: 34,
+    End: 35, Home: 36, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39,
+    ArrowDown: 40, Insert: 45, Delete: 46, Meta: 91, ContextMenu: 93,
   };
   if (named[key]) return named[key];
-  if (key.length === 1) return key.toUpperCase().charCodeAt(0);
+  const code = String(message.code || "");
+  if (/^Key[A-Z]$/.test(code)) return code.charCodeAt(3);
+  if (/^Digit[0-9]$/.test(code)) return code.charCodeAt(5);
+  if (/^Numpad[0-9]$/.test(code)) return 96 + Number(code.slice(-1));
+  const byCode = {
+    NumpadMultiply: 106, NumpadAdd: 107, NumpadSubtract: 109, NumpadDecimal: 110, NumpadDivide: 111,
+    Semicolon: 186, Equal: 187, Comma: 188, Minus: 189, Period: 190, Slash: 191,
+    Backquote: 192, BracketLeft: 219, Backslash: 220, BracketRight: 221, Quote: 222,
+  };
+  if (byCode[code]) return byCode[code];
+  if (/^[a-z0-9]$/i.test(key)) return key.toUpperCase().charCodeAt(0);
   const functionKey = /^F([1-9]|1[0-2])$/.exec(key);
   return functionKey ? 111 + Number(functionKey[1]) : 0;
 }
 
-async function dispatchInput(message) {
-  if (!target) throw new Error("尚未选择控制目标");
-  if (target instanceof NativeWindowTarget) {
+function keyIdentity(message) {
+  return String(message.code || message.key || "");
+}
+
+async function dispatchInput(message, dispatchTarget = target) {
+  if (!dispatchTarget) throw new Error("尚未选择控制目标");
+  if (dispatchTarget instanceof NativeWindowTarget) {
     const normalized = {
       ...message,
       x: Number(message.x) * coordinateMap.scaleX + coordinateMap.offsetX,
       y: Number(message.y) * coordinateMap.scaleY + coordinateMap.offsetY,
     };
-    if (message.type === "pointer") return nativeHost.pointer(target.handle, normalized, "move", captureInfo.surface);
-    if (message.type === "pointer-down") return nativeHost.pointer(target.handle, normalized, "down", captureInfo.surface);
-    if (message.type === "pointer-up") return nativeHost.pointer(target.handle, normalized, "up", captureInfo.surface);
-    if (message.type === "click") return nativeHost.pointer(target.handle, normalized, "click", captureInfo.surface);
-    if (["key", "key-down", "key-up"].includes(message.type)) {
-      const keyCode = virtualKey(String(message.key || ""));
-      if (!keyCode) return;
-      const code = String(message.code || "");
-      if (message.type === "key" || message.type === "key-down") await nativeHost.key(target.handle, keyCode, code, true);
-      if (message.type === "key" || message.type === "key-up") await nativeHost.key(target.handle, keyCode, code, false);
-    }
-    return;
-  }
-  await target.setRemoteDispatch(true);
-  try {
-    if (["pointer", "pointer-down", "pointer-up", "click"].includes(message.type)) {
-    const viewport = await target.getViewport();
-    const normalizedX = Number(message.x) * coordinateMap.scaleX + coordinateMap.offsetX;
-    const normalizedY = Number(message.y) * coordinateMap.scaleY + coordinateMap.offsetY;
-    const x = Math.max(0, Math.min(viewport.width - 1, normalizedX * viewport.width));
-    const y = Math.max(0, Math.min(viewport.height - 1, normalizedY * viewport.height));
-    if (message.type === "pointer") {
-      await target.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: Number(message.buttons) || 0 });
-    } else {
-      const button = ["left", "middle", "right"][Number(message.button) || 0] || "left";
-      if (message.type === "click" || message.type === "pointer-down") {
-        await target.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, buttons: Number(message.buttons) || (button === "left" ? 1 : button === "right" ? 2 : 4), clickCount: 1 });
-      }
-      if (message.type === "click" || message.type === "pointer-up") {
-        await target.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, buttons: Number(message.buttons) || 0, clickCount: 1 });
-      }
-    }
+    if (message.type === "pointer") return nativeHost.pointer(dispatchTarget.handle, normalized, "move", captureInfo.surface);
+    if (message.type === "pointer-down") return nativeHost.pointer(dispatchTarget.handle, normalized, "down", captureInfo.surface);
+    if (message.type === "pointer-up") return nativeHost.pointer(dispatchTarget.handle, normalized, "up", captureInfo.surface);
+    if (message.type === "click") return nativeHost.pointer(dispatchTarget.handle, normalized, "click", captureInfo.surface);
+    if (message.type === "text") {
+      const text = String(message.text || "");
+      if (text) await nativeHost.text(dispatchTarget.handle, text);
       return;
     }
     if (["key", "key-down", "key-up"].includes(message.type)) {
-    const key = String(message.key || "");
-    if (!key) return;
-    const modifiers = modifierMask(message);
-    const keyCode = virtualKey(key);
-    const printable = key.length === 1 && !(message.ctrlKey || message.altKey || message.metaKey);
-    const common = {
-      key,
-      code: String(message.code || ""),
-      modifiers,
-      windowsVirtualKeyCode: keyCode,
-      nativeVirtualKeyCode: keyCode,
-      isKeypad: String(message.code || "").startsWith("Numpad"),
-      autoRepeat: Boolean(message.repeat),
-    };
-    if (message.type === "key" || message.type === "key-down") {
-      await target.send("Input.dispatchKeyEvent", {
-        type: "keyDown",
-        ...common,
-        ...(printable ? { text: key, unmodifiedText: key } : {}),
-      });
+      const keyCode = virtualKey(message);
+      if (!keyCode) return;
+      const code = String(message.code || "");
+      if (message.type === "key" || message.type === "key-down") await nativeHost.key(dispatchTarget.handle, keyCode, code, true);
+      if (message.type === "key" || message.type === "key-up") await nativeHost.key(dispatchTarget.handle, keyCode, code, false);
+      const identity = keyIdentity(message);
+      if (message.type === "key-down" && identity) pressedKeys.set(identity, { ...message });
+      if (message.type === "key-up" && identity) pressedKeys.delete(identity);
     }
-    if (message.type === "key" || message.type === "key-up") {
-      await target.send("Input.dispatchKeyEvent", { type: "keyUp", ...common });
+    return;
+  }
+  await dispatchTarget.setRemoteDispatch(true);
+  try {
+    if (message.type === "text") {
+      const text = String(message.text || "");
+      if (text) {
+        try {
+          await dispatchTarget.send("Input.insertText", { text });
+        } catch {
+          await dispatchTarget.send("Input.dispatchKeyEvent", { type: "char", text, unmodifiedText: text });
+        }
+      }
+      return;
     }
+    if (["pointer", "pointer-down", "pointer-up", "click"].includes(message.type)) {
+      const viewport = await dispatchTarget.getViewport();
+      const normalizedX = Number(message.x) * coordinateMap.scaleX + coordinateMap.offsetX;
+      const normalizedY = Number(message.y) * coordinateMap.scaleY + coordinateMap.offsetY;
+      const x = Math.max(0, Math.min(viewport.width - 1, normalizedX * viewport.width));
+      const y = Math.max(0, Math.min(viewport.height - 1, normalizedY * viewport.height));
+      if (message.type === "pointer") {
+        await dispatchTarget.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: Number(message.buttons) || 0, modifiers: modifierMask(message) });
+      } else {
+        const button = ["left", "middle", "right"][Number(message.button) || 0] || "left";
+        if (message.type === "click" || message.type === "pointer-down") {
+          await dispatchTarget.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button, buttons: Number(message.buttons) || (button === "left" ? 1 : button === "right" ? 2 : 4), clickCount: 1, modifiers: modifierMask(message) });
+        }
+        if (message.type === "click" || message.type === "pointer-up") {
+          await dispatchTarget.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button, buttons: Number(message.buttons) || 0, clickCount: 1, modifiers: modifierMask(message) });
+        }
+      }
+      return;
+    }
+    if (["key", "key-down", "key-up"].includes(message.type)) {
+      const key = String(message.key || "");
+      if (!key) return;
+      const modifiers = modifierMask(message);
+      const keyCode = virtualKey(message);
+      const printable = key.length === 1 && !(message.ctrlKey || message.altKey || message.metaKey);
+      const common = {
+        key,
+        code: String(message.code || ""),
+        modifiers,
+        windowsVirtualKeyCode: keyCode,
+        nativeVirtualKeyCode: keyCode,
+        location: Number(message.location) || 0,
+        isKeypad: String(message.code || "").startsWith("Numpad"),
+        isSystemKey: Boolean(message.altKey),
+        autoRepeat: Boolean(message.repeat),
+      };
+      if (message.type === "key" || message.type === "key-down") {
+        await dispatchTarget.send("Input.dispatchKeyEvent", {
+          type: printable ? "keyDown" : "rawKeyDown",
+          ...common,
+          ...(printable ? { text: key, unmodifiedText: message.shiftKey ? key.toLowerCase() : key } : {}),
+        });
+      }
+      if (message.type === "key" || message.type === "key-up") {
+        await dispatchTarget.send("Input.dispatchKeyEvent", { type: "keyUp", ...common });
+      }
+      const identity = keyIdentity(message);
+      if (message.type === "key-down" && identity) pressedKeys.set(identity, { ...message });
+      if (message.type === "key-up" && identity) pressedKeys.delete(identity);
     }
   } finally {
-    await target?.setRemoteDispatch(false);
+    await dispatchTarget.setRemoteDispatch(false);
+  }
+}
+
+async function releasePressedKeys(instance) {
+  const releases = [...pressedKeys.values()];
+  pressedKeys.clear();
+  for (const message of releases.reverse()) {
+    try { await dispatchInput({ ...message, type: "key-up", repeat: false }, instance); }
+    catch { /* The target may already be closed; clearing local state is still required. */ }
   }
 }
 
@@ -432,12 +485,14 @@ wss.on("connection", (socket) => {
             throw error;
           }
         }
+        if (!message.enabled) await releasePressedKeys(target);
         armed = Boolean(message.enabled);
         await target?.setLocalInputLocked(Boolean(calibration) || (armed && remoteTurn));
         reply(socket, { type: "control-state", enabled: armed });
         return;
       }
       if (message.type === "set-turn") {
+        if (remoteTurn && !message.remote) await releasePressedKeys(target);
         remoteTurn = Boolean(message.remote);
         await target?.setLocalInputLocked(Boolean(calibration) || (armed && remoteTurn));
         reply(socket, { type: "turn-state", remote: remoteTurn, localInputLocked: Boolean(target && (calibration || (armed && remoteTurn))) });
@@ -445,6 +500,7 @@ wss.on("connection", (socket) => {
       }
       if (message.type === "start-calibration") {
         if (!target) throw new Error("尚未选择控制目标");
+        await releasePressedKeys(target);
         armed = false;
         reply(socket, { type: "control-state", enabled: false });
         await target.setLocalInputLocked(false);
@@ -469,7 +525,7 @@ wss.on("connection", (socket) => {
         reply(socket, { type: "calibration-state", state: "off" });
         return;
       }
-      if (["pointer", "pointer-down", "pointer-up", "click", "key", "key-down", "key-up"].includes(message.type)) {
+      if (["pointer", "pointer-down", "pointer-up", "click", "key", "key-down", "key-up", "text"].includes(message.type)) {
         inputQueue = inputQueue.catch(() => {}).then(async () => {
           if (calibration) await handleCalibration(message, socket);
           else if (armed) await dispatchInput(message);

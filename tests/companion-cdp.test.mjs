@@ -144,13 +144,30 @@ test("页面助手通过 CDP 按 viewport CSS 像素注入输入", async (t) => 
   client.send(JSON.stringify({ type: "pointer-up", x: 0.35, y: 0.4, button: 0, buttons: 0 }));
   client.send(JSON.stringify({ type: "key-down", key: "a", code: "KeyA" }));
   client.send(JSON.stringify({ type: "key-up", key: "a", code: "KeyA" }));
+  client.send(JSON.stringify({ type: "key-down", key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 }));
+  client.send(JSON.stringify({ type: "key-up", key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 }));
+  client.send(JSON.stringify({ type: "text", text: "输入文字" }));
   await new Promise((resolve) => setTimeout(resolve, 150));
 
   const moved = commands.find((command) => command.params?.type === "mouseMoved");
   assert.ok(Math.abs(moved.params.x - 310) < 0.001);
   assert.ok(Math.abs(moved.params.y - 155) < 0.001);
   assert.equal(commands.filter((command) => command.method === "Input.dispatchMouseEvent").length, 3);
-  assert.deepEqual(commands.filter((command) => command.method === "Input.dispatchKeyEvent").map((command) => command.params.type), ["keyDown", "keyUp"]);
+  assert.deepEqual(commands.filter((command) => command.method === "Input.dispatchKeyEvent").map((command) => command.params.type), ["keyDown", "keyUp", "rawKeyDown", "keyUp"]);
+  const arrowDown = commands.find((command) => command.params?.type === "rawKeyDown");
+  assert.equal(arrowDown.params.windowsVirtualKeyCode, 37);
+  assert.equal(arrowDown.params.code, "ArrowLeft");
+  assert.equal(commands.find((command) => command.method === "Input.insertText").params.text, "输入文字");
+
+  client.send(JSON.stringify({ type: "key-down", key: " ", code: "Space", keyCode: 32 }));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  client.send(JSON.stringify({ type: "set-control", enabled: false }));
+  assert.equal((await nextMessage("control-state")).enabled, false);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const spaceEvents = commands
+    .filter((command) => command.method === "Input.dispatchKeyEvent" && command.params.code === "Space")
+    .map((command) => command.params.type);
+  assert.deepEqual(spaceEvents, ["keyDown", "keyUp"]);
   const evaluations = commands.filter((command) => command.method === "Runtime.evaluate").map((command) => command.params.expression);
   assert.ok(evaluations.some((expression) => expression.includes("guard.locked = true")));
   assert.ok(evaluations.some((expression) => expression.includes("remote = true")));

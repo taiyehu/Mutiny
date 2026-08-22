@@ -54,8 +54,6 @@ public static class MutinyWindows {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
   [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
   [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
   [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
   [DllImport("user32.dll")] public static extern uint MapVirtualKey(uint code, uint mapType);
@@ -137,6 +135,18 @@ public static class MutinyWindows {
     return Bounds(handle);
   }
 
+  private static void SendMouseButton(uint flags) {
+    var input = new INPUT {
+      Type = 0,
+      Data = new INPUTUNION { Mouse = new MOUSEINPUT {
+        X = 0, Y = 0, MouseData = 0, Flags = flags, Time = 0, ExtraInfo = IntPtr.Zero,
+      } },
+    };
+    if (SendInput(1, new[] { input }, Marshal.SizeOf(typeof(INPUT))) != 1) {
+      throw new InvalidOperationException("SEND_INPUT_FAILED");
+    }
+  }
+
   public static void Pointer(long handle, double normalizedX, double normalizedY, string action, int button, string surface) {
     var bounds = PointerBounds(handle, surface);
     if (bounds == null) throw new InvalidOperationException("The target window is closed");
@@ -147,8 +157,8 @@ public static class MutinyWindows {
     if ((action == "down" || action == "click") && GetAncestor(WindowFromPoint(new POINT(x, y)), 2) != new IntPtr(handle)) throw new InvalidOperationException("The selected point is covered by another window");
     uint down = button == 2 ? 0x0008u : button == 1 ? 0x0020u : 0x0002u;
     uint up = button == 2 ? 0x0010u : button == 1 ? 0x0040u : 0x0004u;
-    if (action == "down" || action == "click") mouse_event(down, 0, 0, 0, UIntPtr.Zero);
-    if (action == "up" || action == "click") mouse_event(up, 0, 0, 0, UIntPtr.Zero);
+    if (action == "down" || action == "click") SendMouseButton(down);
+    if (action == "up" || action == "click") SendMouseButton(up);
   }
 
   public static void Key(long handle, int virtualKey, string code, bool down) {
@@ -171,6 +181,30 @@ public static class MutinyWindows {
       } },
     };
     if (SendInput(1, new[] { input }, Marshal.SizeOf(typeof(INPUT))) != 1) throw new InvalidOperationException("SEND_INPUT_FAILED");
+  }
+
+  public static void Text(long handle, string text) {
+    if (String.IsNullOrEmpty(text)) return;
+    if (!Activate(handle)) throw new InvalidOperationException("Unable to focus the target window; click it locally once and retry");
+    var inputs = new List<INPUT>(text.Length * 2);
+    foreach (var character in text) {
+      inputs.Add(new INPUT {
+        Type = 1,
+        Data = new INPUTUNION { Keyboard = new KEYBDINPUT {
+          VirtualKey = 0, ScanCode = character, Flags = 0x0004u, Time = 0, ExtraInfo = IntPtr.Zero,
+        } },
+      });
+      inputs.Add(new INPUT {
+        Type = 1,
+        Data = new INPUTUNION { Keyboard = new KEYBDINPUT {
+          VirtualKey = 0, ScanCode = character, Flags = 0x0004u | 0x0002u, Time = 0, ExtraInfo = IntPtr.Zero,
+        } },
+      });
+    }
+    var batch = inputs.ToArray();
+    if (SendInput((uint)batch.Length, batch, Marshal.SizeOf(typeof(INPUT))) != batch.Length) {
+      throw new InvalidOperationException("SEND_INPUT_FAILED");
+    }
   }
 }
 '@
@@ -201,6 +235,10 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
       }
       "key" {
         [MutinyWindows]::Key([long]$message.handle, [int]$message.virtualKey, [string]$message.code, [bool]$message.down)
+        Send-Result @{ id = $message.id; ok = $true }
+      }
+      "text" {
+        [MutinyWindows]::Text([long]$message.handle, [string]$message.text)
         Send-Result @{ id = $message.id; ok = $true }
       }
       default { throw "UNKNOWN_COMMAND" }

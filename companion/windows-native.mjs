@@ -76,5 +76,6 @@ export class WindowsNativeHost {
     return this.send({ command: "pointer", handle, x: Number(message.x), y: Number(message.y), button: Number(message.button) || 0, action, surface });
   }
   key(handle, virtualKey, code, down) { return this.send({ command: "key", handle, virtualKey, code, down }); }
+  text(handle, text) { return this.send({ command: "text", handle, text: String(text || "") }); }
   close() { this.process?.kill(); this.process = null; }
 }

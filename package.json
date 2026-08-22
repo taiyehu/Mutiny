@@ -31,6 +31,7 @@
     "drizzle-orm": "0.45.2",
     "react": "19.2.6",
     "react-dom": "19.2.6",
+    "react-simple-keyboard": "^3.8.257",
     "ws": "^8.21.3"
   },
   "devDependencies": {

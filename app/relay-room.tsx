@@ -3,17 +3,76 @@
 /* eslint-disable @next/next/no-html-link-for-pages -- vinext 1.0 beta 的 Link 在生产环境会触发 RSC 预取异常。 */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Keyboard from "react-simple-keyboard";
 
 type AppRole = "host" | "guest" | null;
 type PeerRole = "controller" | "spectator";
 type Peer = { peerId: string; name: string; role: PeerRole; approved: boolean };
-type RemoteEvent = { type: "pointer" | "pointer-down" | "pointer-up" | "click" | "key" | "key-down" | "key-up"; x?: number; y?: number; button?: number; buttons?: number; key?: string; code?: string; repeat?: boolean; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean };
+type RemoteEvent = { type: "pointer" | "pointer-down" | "pointer-up" | "click" | "key" | "key-down" | "key-up" | "text"; x?: number; y?: number; button?: number; buttons?: number; key?: string; code?: string; keyCode?: number; location?: number; repeat?: boolean; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; text?: string };
 type ControlTarget = { id: string; title: string; url: string; kind: "browser" | "window"; width?: number; height?: number };
 type Quality = { rtt: number | null; bitrate: number; fps: number | null; lost: number };
 type IceServerMessage = { type: "ice-servers"; iceServers: RTCIceServer[]; turnEnabled: boolean; error?: string | null };
 type ControlState = { ownerPeerId: string; ownerName: string; mode: "free"; calibrationReady: boolean; calibrationStep: "off" | "point-1" | "point-2" | "complete"; calibrationMessage: string | null; phase: "setup" | "calibration" | "ready" | "playing"; leaseUntil: number };
 
 const configuredSignalUrl = process.env.NEXT_PUBLIC_SIGNAL_URL;
+
+type VirtualKey = { key: string; code: string; keyCode: number; shiftKey?: boolean };
+
+const virtualKeyboardLayout = {
+  default: [
+    "1 2 3 4 5 6 7 8 9 0 {bksp}",
+    "q w e r t y u i o p",
+    "a s d f g h j k l {enter}",
+    "{shift} z x c v b n m , . /",
+    "{esc} {arrowleft} {arrowup} {arrowdown} {arrowright} {space}",
+  ],
+  shift: [
+    "! @ # $ % ^ & * ( ) {bksp}",
+    "Q W E R T Y U I O P",
+    "A S D F G H J K L {enter}",
+    "{shift} Z X C V B N M < > ?",
+    "{esc} {arrowleft} {arrowup} {arrowdown} {arrowright} {space}",
+  ],
+};
+
+const namedVirtualKeys: Record<string, VirtualKey> = {
+  "{bksp}": { key: "Backspace", code: "Backspace", keyCode: 8 },
+  "{enter}": { key: "Enter", code: "Enter", keyCode: 13 },
+  "{esc}": { key: "Escape", code: "Escape", keyCode: 27 },
+  "{space}": { key: " ", code: "Space", keyCode: 32 },
+  "{arrowleft}": { key: "ArrowLeft", code: "ArrowLeft", keyCode: 37 },
+  "{arrowup}": { key: "ArrowUp", code: "ArrowUp", keyCode: 38 },
+  "{arrowright}": { key: "ArrowRight", code: "ArrowRight", keyCode: 39 },
+  "{arrowdown}": { key: "ArrowDown", code: "ArrowDown", keyCode: 40 },
+};
+
+const punctuationKeys: Record<string, { code: string; keyCode: number }> = {
+  ";": { code: "Semicolon", keyCode: 186 }, "=": { code: "Equal", keyCode: 187 },
+  ",": { code: "Comma", keyCode: 188 }, "-": { code: "Minus", keyCode: 189 },
+  ".": { code: "Period", keyCode: 190 }, "/": { code: "Slash", keyCode: 191 },
+  "`": { code: "Backquote", keyCode: 192 }, "[": { code: "BracketLeft", keyCode: 219 },
+  "\\": { code: "Backslash", keyCode: 220 }, "]": { code: "BracketRight", keyCode: 221 },
+  "'": { code: "Quote", keyCode: 222 },
+  ":": { code: "Semicolon", keyCode: 186 }, "+": { code: "Equal", keyCode: 187 },
+  "<": { code: "Comma", keyCode: 188 }, "_": { code: "Minus", keyCode: 189 },
+  ">": { code: "Period", keyCode: 190 }, "?": { code: "Slash", keyCode: 191 },
+  "~": { code: "Backquote", keyCode: 192 }, "{": { code: "BracketLeft", keyCode: 219 },
+  "|": { code: "Backslash", keyCode: 220 }, "}": { code: "BracketRight", keyCode: 221 },
+  "\"": { code: "Quote", keyCode: 222 },
+};
+
+function virtualKey(button: string): VirtualKey | null {
+  if (namedVirtualKeys[button]) return namedVirtualKeys[button];
+  if (button.length !== 1) return null;
+  const upper = button.toUpperCase();
+  if (/^[A-Z]$/.test(upper)) return { key: button, code: "Key" + upper, keyCode: upper.charCodeAt(0), shiftKey: button === upper };
+  if (/^[0-9]$/.test(button)) return { key: button, code: "Digit" + button, keyCode: button.charCodeAt(0) };
+  const shiftedDigits = ")!@#$%^&*(";
+  const shiftedIndex = shiftedDigits.indexOf(button);
+  if (shiftedIndex >= 0) return { key: button, code: "Digit" + shiftedIndex, keyCode: 48 + shiftedIndex, shiftKey: true };
+  const punctuation = punctuationKeys[button];
+  return punctuation ? { key: button, ...punctuation, shiftKey: ":+<_>?~{|}\"".includes(button) } : null;
+}
 
 function signalUrl() {
   if (configuredSignalUrl) return configuredSignalUrl;
@@ -105,6 +164,7 @@ export default function RelayRoom() {
   const [selfPeerId, setSelfPeerId] = useState("");
   const [control, setControl] = useState<ControlState | null>(null);
   const [isChangingShare, setIsChangingShare] = useState(false);
+  const [keyboardLayoutName, setKeyboardLayoutName] = useState<"default" | "shift">("default");
 
   const roleRef = useRef<AppRole>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -128,6 +188,7 @@ export default function RelayRoom() {
   const browserTargetReadyRef = useRef(false);
   const companionAttemptRef = useRef(0);
   const companionConnectedOnceRef = useRef(false);
+  const pressedVirtualKeysRef = useRef(new Map<string, VirtualKey>());
 
   useEffect(() => { roleRef.current = role; }, [role]);
   useEffect(() => { selfPeerIdRef.current = selfPeerId; }, [selfPeerId]);
@@ -162,6 +223,8 @@ export default function RelayRoom() {
       window.setTimeout(() => setRemotePointer((old) => ({ ...old, click: false })), 260);
     } else if (event.type === "key" || event.type === "key-down") {
       setLastCommand(`按下 ${event.key}`);
+    } else if (event.type === "text") {
+      setLastCommand(`输入 ${event.text}`);
     }
   }, [forwardToCompanion]);
 
@@ -649,9 +712,33 @@ export default function RelayRoom() {
 
   const cancelHostCalibration = () => sendSignal({ type: "cancel-calibration" });
 
-  const tapRemoteKey = (key: string, code: string) => {
-    sendControl({ type: "key-down", key, code });
-    sendControl({ type: "key-up", key, code });
+  const pressVirtualKey = (button: string) => {
+    if (!canGuestControl) return;
+    if (button === "{shift}") {
+      setKeyboardLayoutName((current) => current === "default" ? "shift" : "default");
+      return;
+    }
+    if (pressedVirtualKeysRef.current.has(button)) return;
+    const entry = virtualKey(button);
+    if (!entry) return;
+    pressedVirtualKeysRef.current.set(button, entry);
+    if (entry.shiftKey) sendControl({ type: "key-down", key: "Shift", code: "ShiftLeft", keyCode: 16, location: 1, shiftKey: true });
+    sendControl({ type: "key-down", ...entry });
+  };
+
+  const releaseVirtualKey = (button: string) => {
+    const entry = pressedVirtualKeysRef.current.get(button);
+    if (!entry) return;
+    pressedVirtualKeysRef.current.delete(button);
+    sendControl({ type: "key-up", ...entry });
+    if (entry.shiftKey) {
+      sendControl({ type: "key-up", key: "Shift", code: "ShiftLeft", keyCode: 16, location: 1 });
+      setKeyboardLayoutName("default");
+    }
+  };
+
+  const sendRemoteText = (text: string) => {
+    if (text) sendControl({ type: "text", text });
   };
 
   const reset = useCallback(() => {
@@ -664,7 +751,7 @@ export default function RelayRoom() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     wsRef.current = null; companionRef.current = null; streamRef.current = null;
     pcsRef.current.clear(); channelsRef.current.clear(); candidateQueueRef.current.clear();
-    peersRef.current = []; selfPeerIdRef.current = ""; controlRef.current = null; desktopControlEnabledRef.current = false; calibrationActiveRef.current = false; turnEnabledRef.current = false; rtcConfigRef.current = defaultRtcConfig(); setDesktopControlEnabled(false); setBrowserTargets([]); setBrowserTargetId(""); setBrowserTargetReady(false); setBrowserViewport(null); setCalibrationState("off"); setZoom(1); setRole(null); roleRef.current = null; setRoomCode(""); setSelfPeerId(""); setControl(null); setPeers([]); setConnectedPeers(0); setTurnStatus("正在检查 ICE"); setMediaPath("等待连接"); setStatus("本地服务未连接"); setNotice(""); setCompanionState("off");
+    peersRef.current = []; selfPeerIdRef.current = ""; controlRef.current = null; desktopControlEnabledRef.current = false; calibrationActiveRef.current = false; turnEnabledRef.current = false; rtcConfigRef.current = defaultRtcConfig(); pressedVirtualKeysRef.current.clear(); setKeyboardLayoutName("default"); setDesktopControlEnabled(false); setBrowserTargets([]); setBrowserTargetId(""); setBrowserTargetReady(false); setBrowserViewport(null); setCalibrationState("off"); setZoom(1); setRole(null); roleRef.current = null; setRoomCode(""); setSelfPeerId(""); setControl(null); setPeers([]); setConnectedPeers(0); setTurnStatus("正在检查 ICE"); setMediaPath("等待连接"); setStatus("本地服务未连接"); setNotice(""); setCompanionState("off");
   }, []);
 
   const closeHostedRoom = () => {
@@ -767,8 +854,8 @@ export default function RelayRoom() {
                 onPointerUp={canGuestControl ? (event) => { event.preventDefault(); pointerEvent(event, "pointer-up"); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); } : undefined}
                 onPointerCancel={canGuestControl ? (event) => pointerEvent(event, "pointer-up") : undefined}
                 onContextMenu={canGuestControl ? (event) => event.preventDefault() : undefined}
-                onKeyDown={canGuestControl ? (event) => { event.preventDefault(); sendControl({ type: "key-down", key: event.key, code: event.code, repeat: event.repeat, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }); } : undefined}
-                onKeyUp={canGuestControl ? (event) => { event.preventDefault(); sendControl({ type: "key-up", key: event.key, code: event.code, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }); } : undefined}>
+                onKeyDown={canGuestControl ? (event) => { event.preventDefault(); sendControl({ type: "key-down", key: event.key, code: event.code, keyCode: event.keyCode, location: event.location, repeat: event.repeat, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }); } : undefined}
+                onKeyUp={canGuestControl ? (event) => { event.preventDefault(); sendControl({ type: "key-up", key: event.key, code: event.code, keyCode: event.keyCode, location: event.location, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }); } : undefined}>
                 {/* 屏幕共享流没有可供网页提供的字幕轨道。 */}
                 {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
                 <video ref={role === "host" ? localVideoRef : remoteVideoRef} autoPlay playsInline muted={role === "host"} onLoadedMetadata={(event) => syncVideoAspect(event.currentTarget)} onResize={(event) => syncVideoAspect(event.currentTarget)} />
@@ -778,10 +865,29 @@ export default function RelayRoom() {
             </div>
           </div>
           <div className="commandLog"><span>最近操作</span><strong>{lastCommand}</strong></div>
-          {role === "guest" && <div className="mobileControls" aria-label="触屏快捷键">
-            <div className="mobileDpad"><button disabled={!canGuestControl} onClick={() => tapRemoteKey("ArrowUp", "ArrowUp")}>↑</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey("ArrowLeft", "ArrowLeft")}>←</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey("ArrowDown", "ArrowDown")}>↓</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey("ArrowRight", "ArrowRight")}>→</button></div>
-            <div className="mobileActionKeys"><button disabled={!canGuestControl} onClick={() => tapRemoteKey("Escape", "Escape")}>ESC</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey(" ", "Space")}>SPACE</button><button disabled={!canGuestControl} onClick={() => tapRemoteKey("Enter", "Enter")}>ENTER</button></div>
-            <input aria-label="发送文字到远端应用" disabled={!canGuestControl} enterKeyHint="send" placeholder="点此打开手机键盘" value="" onChange={(event) => { for (const character of event.target.value) tapRemoteKey(character, ""); }} onKeyDown={(event) => { if (event.key.length !== 1) { event.preventDefault(); tapRemoteKey(event.key, event.code); } }} />
+          {role === "guest" && <div className={`mobileControls ${canGuestControl ? "" : "disabled"}`} aria-label="触屏模拟键盘">
+            <div className="mobileKeyboardHeader"><strong>模拟键盘</strong><span>按住方向键或动作键可连续操作</span></div>
+            <Keyboard
+              layout={virtualKeyboardLayout}
+              layoutName={keyboardLayoutName}
+              onKeyPress={pressVirtualKey}
+              onKeyReleased={releaseVirtualKey}
+              disableButtonHold
+              preventMouseDownDefault
+              stopMouseDownPropagation
+              stopMouseUpPropagation
+              theme="hg-theme-default mutinyKeyboard"
+              display={{
+                "{bksp}": "⌫", "{enter}": "ENTER", "{shift}": "SHIFT", "{esc}": "ESC",
+                "{arrowleft}": "←", "{arrowup}": "↑", "{arrowdown}": "↓", "{arrowright}": "→", "{space}": "SPACE",
+              }}
+              buttonTheme={[
+                { class: "remoteDirectionKey", buttons: "{arrowleft} {arrowup} {arrowdown} {arrowright}" },
+                { class: "remoteActionKey", buttons: "{esc} {enter} {space}" },
+                { class: "remoteSpaceKey", buttons: "{space}" },
+              ]}
+            />
+            <input aria-label="使用系统键盘发送文字到远端应用" disabled={!canGuestControl} inputMode="text" enterKeyHint="done" placeholder="也可点此使用手机系统键盘输入文字" onInput={(event) => { const inputEvent = event.nativeEvent as InputEvent; if (inputEvent.isComposing) return; sendRemoteText(event.currentTarget.value); event.currentTarget.value = ""; }} />
           </div>}
         </div>
 

@@ -77,6 +77,7 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(companion, /Page\.getLayoutMetrics/);
   assert.match(companion, /Input\.dispatchMouseEvent/);
   assert.match(companion, /Input\.dispatchKeyEvent/);
+  assert.match(companion, /Input\.insertText/);
   assert.match(proxy, /PUBLIC_HTTP_PORT/);
   assert.match(hostLauncher, /ensureBrowser/);
   assert.match(hostLauncher, /companion\/server\.mjs/);
@@ -94,6 +95,8 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(page, /选择控制目标/);
   assert.match(page, /Windows 应用窗口/);
   assert.match(page, /mobileControls/);
+  assert.match(page, /react-simple-keyboard/);
+  assert.match(page, /onKeyReleased/);
   assert.match(page, /TURN 已就绪/);
   assert.doesNotMatch(page, /红蓝|红方|蓝方|回合对战|turnSecondsLeft/);
   assert.match(page, /校准由房主控制/);
@@ -115,6 +118,8 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(nativeHost, /SendInput/);
   assert.match(nativeHost, /MapVirtualKey/);
   assert.match(companion, /set-capture-info/);
+  assert.match(nativeHost, /0x0004u/);
+  assert.match(nativeHost, /SendMouseButton/);
   assert.match(page, /displaySurface/);
   assert.match(nativeHost, /"activate"/);
   assert.match(signal, /只有房主可以发起校准/);

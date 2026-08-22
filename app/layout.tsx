@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
+import "react-simple-keyboard/build/css/index.css";
 import "./globals.css";
 
 export async function generateMetadata(): Promise<Metadata> {
