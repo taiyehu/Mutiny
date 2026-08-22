@@ -421,6 +421,30 @@ wss.on("connection", (socket) => {
   let armed = false;
   let remoteTurn = false;
   let inputQueue = Promise.resolve();
+  let pendingPointerMove = null;
+  let pointerMoveScheduled = false;
+  const schedulePointerMove = () => {
+    if (pointerMoveScheduled) return;
+    pointerMoveScheduled = true;
+    const queuedMove = inputQueue.catch(() => {}).then(async () => {
+      const latest = pendingPointerMove;
+      pendingPointerMove = null;
+      if (!latest) return;
+      if (armed) await dispatchInput(latest);
+    });
+    inputQueue = queuedMove;
+    void queuedMove.then(
+      () => {
+        pointerMoveScheduled = false;
+        if (pendingPointerMove) schedulePointerMove();
+      },
+      (error) => {
+        pointerMoveScheduled = false;
+        reply(socket, { type: "input-error", operation: "pointer", message: error.message });
+        if (pendingPointerMove) schedulePointerMove();
+      },
+    );
+  };
   socket.on("message", async (raw) => {
     let message;
     try { message = JSON.parse(raw.toString()); } catch { return; }
@@ -525,6 +549,11 @@ wss.on("connection", (socket) => {
         reply(socket, { type: "calibration-state", state: "off" });
         return;
       }
+      if (message.type === "pointer" && !calibration) {
+        pendingPointerMove = message;
+        schedulePointerMove();
+        return;
+      }
       if (["pointer", "pointer-down", "pointer-up", "click", "key", "key-down", "key-up", "text"].includes(message.type)) {
         inputQueue = inputQueue.catch(() => {}).then(async () => {
           if (calibration) await handleCalibration(message, socket);
@@ -548,6 +577,7 @@ wss.on("connection", (socket) => {
       const previousTarget = target;
       target = null;
       calibration = null;
+      pendingPointerMove = null;
       void releaseTarget(previousTarget);
     }
   });

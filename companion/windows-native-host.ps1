@@ -162,7 +162,9 @@ public static class MutinyWindows {
   }
 
   public static void Key(long handle, int virtualKey, string code, bool down) {
-    if (!Activate(handle)) throw new InvalidOperationException("Unable to focus the target window; click it locally once and retry");
+    // A release must never depend on focus activation: failing before SendInput would leave the key held.
+    if (down && GetAncestor(GetForegroundWindow(), 2) != new IntPtr(handle) && !Activate(handle))
+      throw new InvalidOperationException("Unable to focus the target window; click it locally once and retry");
     var scanCode = (ushort)MapVirtualKey((uint)virtualKey, 0);
     var extended = code == "ArrowLeft" || code == "ArrowUp" || code == "ArrowRight" || code == "ArrowDown" ||
       code == "Insert" || code == "Delete" || code == "Home" || code == "End" || code == "PageUp" || code == "PageDown" ||

@@ -139,7 +139,9 @@ test("页面助手通过 CDP 按 viewport CSS 像素注入输入", async (t) => 
   assert.equal(turnState.remote, true);
   assert.equal(turnState.localInputLocked, true);
 
-  client.send(JSON.stringify({ type: "pointer", x: 0.35, y: 0.4 }));
+  for (let index = 0; index < 20; index += 1) {
+    client.send(JSON.stringify({ type: "pointer", x: 0.3 + index / 380, y: 0.35 + index / 380 }));
+  }
   client.send(JSON.stringify({ type: "pointer-down", x: 0.35, y: 0.4, button: 0, buttons: 1 }));
   client.send(JSON.stringify({ type: "pointer-up", x: 0.35, y: 0.4, button: 0, buttons: 0 }));
   client.send(JSON.stringify({ type: "key-down", key: "a", code: "KeyA" }));
@@ -149,10 +151,13 @@ test("页面助手通过 CDP 按 viewport CSS 像素注入输入", async (t) => 
   client.send(JSON.stringify({ type: "text", text: "输入文字" }));
   await new Promise((resolve) => setTimeout(resolve, 150));
 
-  const moved = commands.find((command) => command.params?.type === "mouseMoved");
+  const moves = commands.filter((command) => command.params?.type === "mouseMoved");
+  const moved = moves.at(-1);
+  assert.ok(moves.length >= 1);
+  assert.ok(moves.length <= 2, `鼠标移动应被合并，实际派发 ${moves.length} 次`);
   assert.ok(Math.abs(moved.params.x - 310) < 0.001);
   assert.ok(Math.abs(moved.params.y - 155) < 0.001);
-  assert.equal(commands.filter((command) => command.method === "Input.dispatchMouseEvent").length, 3);
+  assert.equal(commands.filter((command) => command.method === "Input.dispatchMouseEvent").length, moves.length + 2);
   assert.deepEqual(commands.filter((command) => command.method === "Input.dispatchKeyEvent").map((command) => command.params.type), ["keyDown", "keyUp", "rawKeyDown", "keyUp"]);
   const arrowDown = commands.find((command) => command.params?.type === "rawKeyDown");
   assert.equal(arrowDown.params.windowsVirtualKeyCode, 37);

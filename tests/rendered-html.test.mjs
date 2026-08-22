@@ -64,7 +64,8 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(page, /approve-peer/);
   assert.match(page, /getStats/);
   assert.match(page, /createDataChannel\("controls", \{ ordered: true \}\)/);
-  assert.doesNotMatch(page, /maxRetransmits:\s*0/);
+  assert.match(page, /createDataChannel\("pointer", \{ ordered: false, maxRetransmits: 0 \}\)/);
+  assert.match(page, /pointerChannelsRef/);
   assert.match(signal, /new WebSocketServer/);
   assert.match(signal, /roomCode/);
   assert.match(signal, /generate-ice-servers/);
@@ -126,6 +127,11 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(styles, /-webkit-touch-callout:none/);
   assert.match(page, /react-simple-keyboard/);
   assert.match(page, /onKeyReleased/);
+  assert.match(page, /lostpointercapture/);
+  assert.match(page, /visibilitychange/);
+  assert.match(page, /pressedPhysicalKeysRef/);
+  assert.match(companion, /pendingPointerMove/);
+  assert.match(companion, /schedulePointerMove/);
   assert.match(page, /TURN 已就绪/);
   assert.doesNotMatch(page, /红蓝|红方|蓝方|回合对战|turnSecondsLeft/);
   assert.match(page, /校准由房主控制/);
@@ -146,6 +152,7 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(nativeHost, /MonitorFromWindow/);
   assert.match(nativeHost, /SendInput/);
   assert.match(nativeHost, /MapVirtualKey/);
+  assert.match(nativeHost, /if \(down && GetAncestor\(GetForegroundWindow\(\), 2\)/);
   assert.match(companion, /set-capture-info/);
   assert.match(nativeHost, /0x0004u/);
   assert.match(nativeHost, /SendMouseButton/);

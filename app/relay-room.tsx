@@ -239,6 +239,7 @@ export default function RelayRoom() {
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const pcsRef = useRef(new Map<string, RTCPeerConnection>());
   const channelsRef = useRef(new Map<string, RTCDataChannel>());
+  const pointerChannelsRef = useRef(new Map<string, RTCDataChannel>());
   const peersRef = useRef<Peer[]>([]);
   const candidateQueueRef = useRef(new Map<string, RTCIceCandidateInit[]>());
   const companionRef = useRef<WebSocket | null>(null);
@@ -256,6 +257,58 @@ export default function RelayRoom() {
   const companionAttemptRef = useRef(0);
   const companionConnectedOnceRef = useRef(false);
   const pressedVirtualKeysRef = useRef(new Map<string, VirtualKey>());
+  const pressedPointerKeysRef = useRef(new Map<number, string>());
+  const pressedPhysicalKeysRef = useRef(new Map<string, RemoteEvent>());
+
+  useEffect(() => {
+    const sendReliableRelease = (event: RemoteEvent) => {
+      const payload = JSON.stringify(event);
+      for (const channel of channelsRef.current.values()) if (channel.readyState === "open") channel.send(payload);
+    };
+    const releaseVirtualButtonByName = (button: string) => {
+      const entry = pressedVirtualKeysRef.current.get(button);
+      if (!entry) return;
+      pressedVirtualKeysRef.current.delete(button);
+      sendReliableRelease({ type: "key-up", ...entry, repeat: false });
+      if (entry.shiftKey) sendReliableRelease({ type: "key-up", key: "Shift", code: "ShiftLeft", keyCode: 16, location: 1, repeat: false });
+    };
+    const releasePointerKey = (event: PointerEvent) => {
+      const button = pressedPointerKeysRef.current.get(event.pointerId);
+      if (!button) {
+        if (pressedPointerKeysRef.current.size === 0) {
+          for (const name of [...pressedVirtualKeysRef.current.keys()]) releaseVirtualButtonByName(name);
+        }
+        return;
+      }
+      pressedPointerKeysRef.current.delete(event.pointerId);
+      releaseVirtualButtonByName(button);
+    };
+    const releaseAllPressedKeys = () => {
+      for (const event of pressedPhysicalKeysRef.current.values()) {
+        sendReliableRelease({ ...event, type: "key-up", repeat: false });
+      }
+      pressedPhysicalKeysRef.current.clear();
+      for (const button of [...pressedVirtualKeysRef.current.keys()]) releaseVirtualButtonByName(button);
+      pressedPointerKeysRef.current.clear();
+      setKeyboardLayoutName("default");
+    };
+    const releaseWhenHidden = () => {
+      if (document.visibilityState === "hidden") releaseAllPressedKeys();
+    };
+    window.addEventListener("pointerup", releasePointerKey, true);
+    window.addEventListener("pointercancel", releasePointerKey, true);
+    window.addEventListener("lostpointercapture", releasePointerKey, true);
+    window.addEventListener("blur", releaseAllPressedKeys);
+    document.addEventListener("visibilitychange", releaseWhenHidden);
+    return () => {
+      releaseAllPressedKeys();
+      window.removeEventListener("pointerup", releasePointerKey, true);
+      window.removeEventListener("pointercancel", releasePointerKey, true);
+      window.removeEventListener("lostpointercapture", releasePointerKey, true);
+      window.removeEventListener("blur", releaseAllPressedKeys);
+      document.removeEventListener("visibilitychange", releaseWhenHidden);
+    };
+  }, []);
 
   useEffect(() => {
     let restoreTimer: number | undefined;
@@ -313,7 +366,8 @@ export default function RelayRoom() {
   }, [forwardToCompanion]);
 
   const bindChannel = useCallback((peerId: string, channel: RTCDataChannel) => {
-    channelsRef.current.set(peerId, channel);
+    const registry = channel.label === "pointer" ? pointerChannelsRef.current : channelsRef.current;
+    registry.set(peerId, channel);
     channel.onmessage = (event) => {
       if (roleRef.current === "host" && peersRef.current.find((peer) => peer.peerId === peerId)?.role !== "controller") return;
       const state = controlRef.current;
@@ -325,7 +379,7 @@ export default function RelayRoom() {
       if (roleRef.current === "host" && !allowed) return;
       receiveCommand(event);
     };
-    channel.onclose = () => channelsRef.current.delete(peerId);
+    channel.onclose = () => registry.delete(peerId);
   }, [receiveCommand]);
 
   const bindPeer = useCallback((peerId: string, pc: RTCPeerConnection) => {
@@ -358,7 +412,9 @@ export default function RelayRoom() {
     // Keyboard and mouse button transitions must arrive in order. Losing a key-up
     // leaves games thinking the key is held and makes later presses appear inert.
     const channel = pc.createDataChannel("controls", { ordered: true });
+    const pointerChannel = pc.createDataChannel("pointer", { ordered: false, maxRetransmits: 0 });
     bindChannel(peerId, channel);
+    bindChannel(peerId, pointerChannel);
     await pc.setLocalDescription(await pc.createOffer());
     sendSignal({ type: "signal", target: peerId, data: { description: pc.localDescription } });
   }, [bindChannel, bindPeer, sendSignal, videoProfile]);
@@ -392,7 +448,7 @@ export default function RelayRoom() {
   const stopRtc = useCallback(() => {
     for (const pc of pcsRef.current.values()) pc.close();
     pcsRef.current.clear();
-    channelsRef.current.clear();
+    channelsRef.current.clear(); pointerChannelsRef.current.clear();
     candidateQueueRef.current.clear();
     statsPreviousRef.current.clear();
     videoDelayRef.current = null;
@@ -460,12 +516,14 @@ export default function RelayRoom() {
         pcsRef.current.delete(message.peerId);
         channelsRef.current.get(message.peerId)?.close();
         channelsRef.current.delete(message.peerId);
+        pointerChannelsRef.current.get(message.peerId)?.close();
+        pointerChannelsRef.current.delete(message.peerId);
         candidateQueueRef.current.delete(message.peerId);
         void createHostPeer(message.peerId);
       }
       if (message.type === "peer-ready") void createHostPeer(message.peer.peerId);
       if (message.type === "peer-left") {
-        pcsRef.current.get(message.peerId)?.close(); pcsRef.current.delete(message.peerId); channelsRef.current.delete(message.peerId);
+        pcsRef.current.get(message.peerId)?.close(); pcsRef.current.delete(message.peerId); channelsRef.current.delete(message.peerId); pointerChannelsRef.current.delete(message.peerId);
       }
       if (message.type === "role-changed") { setPeerRole(message.role); setStatus(message.role === "controller" ? "房主已授予操作权限" : "房主已切换为只读观战"); }
       if (message.type === "signal") void applySignal(message.from, message.data);
@@ -593,7 +651,21 @@ export default function RelayRoom() {
       ? state.ownerPeerId === selfPeerIdRef.current
       : state?.phase === "playing";
     if (peerRole !== "controller" || !allowed) return;
-    for (const channel of channelsRef.current.values()) if (channel.readyState === "open") channel.send(JSON.stringify(event));
+    const payload = JSON.stringify(event);
+    if (event.type === "pointer") {
+      const pointerChannels = [...pointerChannelsRef.current.values()].filter((channel) => channel.readyState === "open");
+      if (pointerChannels.length) return pointerChannels.forEach((channel) => channel.send(payload));
+    }
+    for (const channel of channelsRef.current.values()) if (channel.readyState === "open") channel.send(payload);
+  };
+
+  const physicalKeyEvent = (event: React.KeyboardEvent<HTMLDivElement>, type: "key-down" | "key-up") => {
+    event.preventDefault();
+    const identity = event.code || event.key;
+    const payload: RemoteEvent = { type, key: event.key, code: event.code, keyCode: event.keyCode, location: event.location, repeat: type === "key-down" && event.repeat, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey };
+    if (type === "key-down") pressedPhysicalKeysRef.current.set(identity, payload);
+    else pressedPhysicalKeysRef.current.delete(identity);
+    sendControl(payload);
   };
 
   const pointerEvent = (event: React.PointerEvent<HTMLDivElement>, type: "pointer" | "pointer-down" | "pointer-up") => {
@@ -828,6 +900,7 @@ export default function RelayRoom() {
   const pressVirtualButton = (event: ReactPointerEvent<HTMLButtonElement>, button: string) => {
     event.preventDefault();
     event.stopPropagation();
+    pressedPointerKeysRef.current.set(event.pointerId, button);
     event.currentTarget.setPointerCapture(event.pointerId);
     pressVirtualKey(button);
   };
@@ -835,6 +908,7 @@ export default function RelayRoom() {
   const releaseVirtualButton = (event: ReactPointerEvent<HTMLButtonElement>, button: string) => {
     event.preventDefault();
     event.stopPropagation();
+    pressedPointerKeysRef.current.delete(event.pointerId);
     releaseVirtualKey(button);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
@@ -875,10 +949,10 @@ export default function RelayRoom() {
     for (const pc of pcsRef.current.values()) pc.close();
     streamRef.current?.getTracks().forEach((track) => track.stop());
     wsRef.current = null; companionRef.current = null; streamRef.current = null;
-    pcsRef.current.clear(); channelsRef.current.clear(); candidateQueueRef.current.clear();
+    pcsRef.current.clear(); channelsRef.current.clear(); pointerChannelsRef.current.clear(); candidateQueueRef.current.clear();
     statsPreviousRef.current.clear();
     videoDelayRef.current = null;
-    peersRef.current = []; selfPeerIdRef.current = ""; controlRef.current = null; desktopControlEnabledRef.current = false; calibrationActiveRef.current = false; turnEnabledRef.current = false; rtcConfigRef.current = defaultRtcConfig(); pressedVirtualKeysRef.current.clear(); setKeyboardLayoutName("default"); setDesktopControlEnabled(false); setBrowserTargets([]); setBrowserTargetId(""); setBrowserTargetReady(false); setBrowserViewport(null); setCalibrationState("off"); setZoom(1); setRole(null); roleRef.current = null; setRoomCode(""); setSelfPeerId(""); setControl(null); setPeers([]); setConnectedPeers(0); setTurnStatus("正在检查 ICE"); setMediaPath("等待连接"); setStatus("本地服务未连接"); setNotice(""); setCompanionState("off");
+    peersRef.current = []; selfPeerIdRef.current = ""; controlRef.current = null; desktopControlEnabledRef.current = false; calibrationActiveRef.current = false; turnEnabledRef.current = false; rtcConfigRef.current = defaultRtcConfig(); pressedVirtualKeysRef.current.clear(); pressedPointerKeysRef.current.clear(); pressedPhysicalKeysRef.current.clear(); setKeyboardLayoutName("default"); setDesktopControlEnabled(false); setBrowserTargets([]); setBrowserTargetId(""); setBrowserTargetReady(false); setBrowserViewport(null); setCalibrationState("off"); setZoom(1); setRole(null); roleRef.current = null; setRoomCode(""); setSelfPeerId(""); setControl(null); setPeers([]); setConnectedPeers(0); setTurnStatus("正在检查 ICE"); setMediaPath("等待连接"); setStatus("本地服务未连接"); setNotice(""); setCompanionState("off");
   }, []);
 
   const closeHostedRoom = () => {
@@ -1043,8 +1117,8 @@ export default function RelayRoom() {
                 onPointerUp={canGuestControl ? (event) => { event.preventDefault(); pointerEvent(event, "pointer-up"); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); } : undefined}
                 onPointerCancel={canGuestControl ? (event) => pointerEvent(event, "pointer-up") : undefined}
                 onContextMenu={canGuestControl ? (event) => event.preventDefault() : undefined}
-                onKeyDown={canGuestControl ? (event) => { event.preventDefault(); sendControl({ type: "key-down", key: event.key, code: event.code, keyCode: event.keyCode, location: event.location, repeat: event.repeat, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }); } : undefined}
-                onKeyUp={canGuestControl ? (event) => { event.preventDefault(); sendControl({ type: "key-up", key: event.key, code: event.code, keyCode: event.keyCode, location: event.location, altKey: event.altKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }); } : undefined}>
+                onKeyDown={canGuestControl ? (event) => physicalKeyEvent(event, "key-down") : undefined}
+                onKeyUp={canGuestControl ? (event) => physicalKeyEvent(event, "key-up") : undefined}>
                 {/* 屏幕共享流没有可供网页提供的字幕轨道。 */}
                 {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
                 <video ref={role === "host" ? localVideoRef : remoteVideoRef} autoPlay playsInline muted={role === "host"} onLoadedMetadata={(event) => syncVideoAspect(event.currentTarget)} onResize={(event) => syncVideoAspect(event.currentTarget)} />
