@@ -3,7 +3,6 @@
 /* eslint-disable @next/next/no-html-link-for-pages -- vinext 1.0 beta 的 Link 在生产环境会触发 RSC 预取异常。 */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
 import Keyboard from "react-simple-keyboard";
 
 type AppRole = "host" | "guest" | null;
@@ -30,7 +29,88 @@ const emptyQuality = (): Quality => ({ rtt: null, videoDelay: null, jitterBuffer
 
 type VirtualKey = { key: string; code: string; keyCode: number; shiftKey?: boolean };
 type RemoteTouchGesture = { pointerId: number; startX: number; startY: number; lastX: number; lastY: number; mode: "pending" | "pointer" | "scroll"; startPoint: { x: number; y: number } };
-const joystickDirectionThreshold = 0.22;
+const joystickDirectionThreshold = 0.16;
+
+type LowLatencyTouchButtonProps = {
+  buttonKey: string;
+  label: string;
+  className?: string;
+  disabled: boolean;
+  onPress: (button: string, pointerId: number) => void;
+  onRelease: (button: string, pointerId: number) => void;
+};
+
+function LowLatencyTouchButton({ buttonKey, label, className, disabled, onPress, onRelease }: LowLatencyTouchButtonProps) {
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const activePointerRef = useRef<number | null>(null);
+  const onPressRef = useRef(onPress);
+  const onReleaseRef = useRef(onRelease);
+  useEffect(() => {
+    onPressRef.current = onPress;
+    onReleaseRef.current = onRelease;
+  }, [onPress, onRelease]);
+
+  useEffect(() => {
+    const element = buttonRef.current;
+    if (!element) return;
+
+    const showPressed = (pressed: boolean) => {
+      if (pressed) element.dataset.pressed = "true";
+      else delete element.dataset.pressed;
+    };
+    const release = (event?: PointerEvent) => {
+      const pointerId = activePointerRef.current;
+      if (pointerId == null || (event && event.pointerId !== pointerId)) return;
+      activePointerRef.current = null;
+      showPressed(false);
+      onReleaseRef.current(buttonKey, pointerId);
+      if (element.hasPointerCapture(pointerId)) {
+        try { element.releasePointerCapture(pointerId); } catch { /* 指针可能已由浏览器释放。 */ }
+      }
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      if (disabled || activePointerRef.current != null || (event.pointerType === "mouse" && event.button !== 0)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      activePointerRef.current = event.pointerId;
+      showPressed(true);
+      try { element.setPointerCapture(event.pointerId); } catch { /* 某些旧版移动浏览器不支持捕获。 */ }
+      onPressRef.current(buttonKey, event.pointerId);
+    };
+    const handlePointerRelease = (event: PointerEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      release(event);
+    };
+    const suppressTouchDefaults = (event: TouchEvent) => {
+      if (disabled) return;
+      event.preventDefault();
+      window.getSelection()?.removeAllRanges();
+    };
+    const suppressContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    element.addEventListener("pointerdown", handlePointerDown);
+    element.addEventListener("pointerup", handlePointerRelease);
+    element.addEventListener("pointercancel", handlePointerRelease);
+    element.addEventListener("lostpointercapture", handlePointerRelease);
+    element.addEventListener("touchstart", suppressTouchDefaults, { passive: false });
+    element.addEventListener("contextmenu", suppressContextMenu);
+    return () => {
+      element.removeEventListener("pointerdown", handlePointerDown);
+      element.removeEventListener("pointerup", handlePointerRelease);
+      element.removeEventListener("pointercancel", handlePointerRelease);
+      element.removeEventListener("lostpointercapture", handlePointerRelease);
+      element.removeEventListener("touchstart", suppressTouchDefaults);
+      element.removeEventListener("contextmenu", suppressContextMenu);
+      release();
+    };
+  }, [buttonKey, disabled]);
+
+  return <button ref={buttonRef} type="button" className={className} draggable={false} disabled={disabled} data-low-latency-button>{label}</button>;
+}
 
 function MobileJoystick({ disabled, onDirectionChange }: { disabled: boolean; onDirectionChange: (directions: string[]) => void }) {
   const zoneRef = useRef<HTMLDivElement | null>(null);
@@ -49,10 +129,10 @@ function MobileJoystick({ disabled, onDirectionChange }: { disabled: boolean; on
       if (disposed) return;
       const created = joysticks.create({
         zone,
-        mode: "static",
-        position: { left: "50%", top: "50%" },
+        mode: "dynamic",
         size: 112,
-        threshold: 0.16,
+        threshold: 0.08,
+        follow: true,
         fadeTime: 0,
         restJoystick: true,
         color: { front: "rgba(255,255,255,.9)", back: "rgba(23,35,31,.76)" },
@@ -75,7 +155,7 @@ function MobileJoystick({ disabled, onDirectionChange }: { disabled: boolean; on
     };
   }, [disabled]);
 
-  return <div ref={zoneRef} className="mobileJoystick" role="application" aria-label="方向摇杆" aria-disabled={disabled}><span className="joystickNorth">↑</span><span className="joystickWest">←</span><span className="joystickEast">→</span><span className="joystickSouth">↓</span></div>;
+  return <div ref={zoneRef} className="mobileJoystick" role="application" aria-label="左侧区域任意位置触摸即可控制方向" aria-disabled={disabled}><div className="mobileJoystickHint" aria-hidden="true"><span className="joystickNorth">↑</span><span className="joystickWest">←</span><span className="joystickEast">→</span><span className="joystickSouth">↓</span><b>触摸移动</b></div></div>;
 }
 
 
@@ -1080,20 +1160,15 @@ export default function RelayRoom() {
   };
 
 
-  const pressVirtualButton = (event: ReactPointerEvent<HTMLButtonElement>, button: string) => {
-    event.preventDefault();
-    event.stopPropagation();
-    pressedPointerKeysRef.current.set(event.pointerId, button);
-    event.currentTarget.setPointerCapture(event.pointerId);
+  const pressVirtualButton = (button: string, pointerId: number) => {
+    pressedPointerKeysRef.current.set(pointerId, button);
     pressVirtualKey(button);
   };
 
-  const releaseVirtualButton = (event: ReactPointerEvent<HTMLButtonElement>, button: string) => {
-    event.preventDefault();
-    event.stopPropagation();
-    pressedPointerKeysRef.current.delete(event.pointerId);
+  const releaseVirtualButton = (button: string, pointerId: number) => {
+    if (pressedPointerKeysRef.current.get(pointerId) !== button) return;
+    pressedPointerKeysRef.current.delete(pointerId);
     releaseVirtualKey(button);
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
   };
 
   const toggleCustomVirtualKey = (button: string) => {
@@ -1357,11 +1432,11 @@ export default function RelayRoom() {
                 {mobileControlsEnabled && <div className="mobileQuickControls">
                   <MobileJoystick disabled={!canGuestControl} onDirectionChange={updateJoystickDirections} />
                   <div className="mobileActionCluster">
-                    {customVirtualKeys.length > 0 && <div className="mobileCustomKeys">{customVirtualKeys.map((button) => <button type="button" draggable={false} key={button} disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, button)} onPointerUp={(event) => releaseVirtualButton(event, button)} onPointerCancel={(event) => releaseVirtualButton(event, button)}>{customVirtualKeyLabels[button]}</button>)}</div>}
+                    {customVirtualKeys.length > 0 && <div className="mobileCustomKeys">{customVirtualKeys.map((button) => <LowLatencyTouchButton key={button} buttonKey={button} label={customVirtualKeyLabels[button]} disabled={!canGuestControl} onPress={pressVirtualButton} onRelease={releaseVirtualButton} />)}</div>}
                     <div className="mobileDefaultActions">
-                      <button type="button" draggable={false} disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{esc}")} onPointerUp={(event) => releaseVirtualButton(event, "{esc}")} onPointerCancel={(event) => releaseVirtualButton(event, "{esc}")}>ESC</button>
-                      <button type="button" draggable={false} className="mobileSpaceButton" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{space}")} onPointerUp={(event) => releaseVirtualButton(event, "{space}")} onPointerCancel={(event) => releaseVirtualButton(event, "{space}")}>SPACE</button>
-                      <button type="button" draggable={false} disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{enter}")} onPointerUp={(event) => releaseVirtualButton(event, "{enter}")} onPointerCancel={(event) => releaseVirtualButton(event, "{enter}")}>ENTER</button>
+                      <LowLatencyTouchButton buttonKey="{esc}" label="ESC" disabled={!canGuestControl} onPress={pressVirtualButton} onRelease={releaseVirtualButton} />
+                      <LowLatencyTouchButton buttonKey="{space}" label="SPACE" className="mobileSpaceButton" disabled={!canGuestControl} onPress={pressVirtualButton} onRelease={releaseVirtualButton} />
+                      <LowLatencyTouchButton buttonKey="{enter}" label="ENTER" disabled={!canGuestControl} onPress={pressVirtualButton} onRelease={releaseVirtualButton} />
                     </div>
                   </div>
                 </div>}
