@@ -146,6 +146,19 @@ public static class MutinyWindows {
       throw new InvalidOperationException("SEND_INPUT_FAILED");
     }
   }
+  private static void SendWheel(uint flags, int delta) {
+    if (delta == 0) return;
+    var input = new INPUT {
+      Type = 0,
+      Data = new INPUTUNION { Mouse = new MOUSEINPUT {
+        X = 0, Y = 0, MouseData = unchecked((uint)delta), Flags = flags, Time = 0, ExtraInfo = IntPtr.Zero,
+      } },
+    };
+    if (SendInput(1, new[] { input }, Marshal.SizeOf(typeof(INPUT))) != 1) {
+      throw new InvalidOperationException("SEND_INPUT_FAILED");
+    }
+  }
+
 
   public static void Pointer(long handle, double normalizedX, double normalizedY, string action, int button, string surface) {
     var bounds = PointerBounds(handle, surface);
@@ -160,6 +173,21 @@ public static class MutinyWindows {
     if (action == "down" || action == "click") SendMouseButton(down);
     if (action == "up" || action == "click") SendMouseButton(up);
   }
+  public static void Scroll(long handle, double normalizedX, double normalizedY, double deltaX, double deltaY, string surface) {
+    if (GetAncestor(GetForegroundWindow(), 2) != new IntPtr(handle) && !Activate(handle))
+      throw new InvalidOperationException("Unable to focus the target window; click it locally once and retry");
+    var bounds = PointerBounds(handle, surface);
+    if (bounds == null) throw new InvalidOperationException("The target window is closed");
+    var x = bounds[0] + (int)Math.Round(Math.Max(0, Math.Min(1, normalizedX)) * Math.Max(1, bounds[2] - bounds[0] - 1));
+    var y = bounds[1] + (int)Math.Round(Math.Max(0, Math.Min(1, normalizedY)) * Math.Max(1, bounds[3] - bounds[1] - 1));
+    SetCursorPos(x, y);
+    if (GetAncestor(WindowFromPoint(new POINT(x, y)), 2) != new IntPtr(handle)) throw new InvalidOperationException("The selected point is covered by another window");
+    var horizontal = Math.Max(-1200, Math.Min(1200, (int)Math.Round(deltaX)));
+    var vertical = Math.Max(-1200, Math.Min(1200, (int)Math.Round(-deltaY)));
+    SendWheel(0x1000u, horizontal);
+    SendWheel(0x0800u, vertical);
+  }
+
 
   public static void Key(long handle, int virtualKey, string code, bool down) {
     // A release must never depend on focus activation: failing before SendInput would leave the key held.
@@ -233,6 +261,10 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
       }
       "pointer" {
         [MutinyWindows]::Pointer([long]$message.handle, [double]$message.x, [double]$message.y, [string]$message.action, [int]$message.button, [string]$message.surface)
+        Send-Result @{ id = $message.id; ok = $true }
+      }
+      "scroll" {
+        [MutinyWindows]::Scroll([long]$message.handle, [double]$message.x, [double]$message.y, [double]$message.deltaX, [double]$message.deltaY, [string]$message.surface)
         Send-Result @{ id = $message.id; ok = $true }
       }
       "key" {

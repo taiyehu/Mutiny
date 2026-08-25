@@ -9,7 +9,7 @@ import Keyboard from "react-simple-keyboard";
 type AppRole = "host" | "guest" | null;
 type PeerRole = "controller" | "spectator";
 type Peer = { peerId: string; name: string; role: PeerRole; approved: boolean };
-type RemoteEvent = { type: "pointer" | "pointer-down" | "pointer-up" | "click" | "key" | "key-down" | "key-up" | "text"; x?: number; y?: number; button?: number; buttons?: number; key?: string; code?: string; keyCode?: number; location?: number; repeat?: boolean; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; text?: string };
+type RemoteEvent = { type: "pointer" | "pointer-down" | "pointer-up" | "click" | "scroll" | "key" | "key-down" | "key-up" | "text"; x?: number; y?: number; button?: number; buttons?: number; deltaX?: number; deltaY?: number; key?: string; code?: string; keyCode?: number; location?: number; repeat?: boolean; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; text?: string };
 type ControlTarget = { id: string; title: string; url: string; kind: "browser" | "window"; width?: number; height?: number };
 type Quality = { rtt: number | null; videoDelay: number | null; jitterBuffer: number | null; jitterBufferMinimum: number | null; jitterBufferTarget: number | null; decodeTime: number | null; bitrate: number; fps: number | null; lost: number; codec: string | null; width: number | null; height: number | null; dropped: number; freezes: number; nack: number; pli: number };
 type VideoProfileKey = "low-latency" | "smooth" | "quality";
@@ -28,6 +28,54 @@ const videoProfiles: Record<VideoProfileKey, VideoProfile> = {
 
 
 type VirtualKey = { key: string; code: string; keyCode: number; shiftKey?: boolean };
+type RemoteTouchGesture = { pointerId: number; startX: number; startY: number; lastX: number; lastY: number; mode: "pending" | "pointer" | "scroll"; startPoint: { x: number; y: number } };
+
+function MobileJoystick({ disabled, onDirectionChange }: { disabled: boolean; onDirectionChange: (directions: string[]) => void }) {
+  const zoneRef = useRef<HTMLDivElement | null>(null);
+  const onDirectionChangeRef = useRef(onDirectionChange);
+  useEffect(() => { onDirectionChangeRef.current = onDirectionChange; }, [onDirectionChange]);
+
+  useEffect(() => {
+    const zone = zoneRef.current;
+    if (!zone || disabled) {
+      onDirectionChangeRef.current([]);
+      return;
+    }
+    let disposed = false;
+    let manager: { destroy(): void } | null = null;
+    void import("nipplejs").then(({ default: joysticks }) => {
+      if (disposed) return;
+      const created = joysticks.create({
+        zone,
+        mode: "static",
+        position: { left: "50%", top: "50%" },
+        size: 112,
+        threshold: 0.24,
+        fadeTime: 0,
+        restJoystick: true,
+        color: { front: "rgba(255,255,255,.9)", back: "rgba(23,35,31,.76)" },
+      });
+      manager = created;
+      created.on("move", ({ data }) => {
+        const directions: string[] = [];
+        if (data.vector.x <= -0.32) directions.push("{arrowleft}");
+        if (data.vector.x >= 0.32) directions.push("{arrowright}");
+        if (data.vector.y >= 0.32) directions.push("{arrowup}");
+        if (data.vector.y <= -0.32) directions.push("{arrowdown}");
+        onDirectionChangeRef.current(directions);
+      });
+      created.on("end", () => onDirectionChangeRef.current([]));
+    }).catch((error) => console.error("虚拟摇杆加载失败", error));
+    return () => {
+      disposed = true;
+      onDirectionChangeRef.current([]);
+      manager?.destroy();
+    };
+  }, [disabled]);
+
+  return <div ref={zoneRef} className="mobileJoystick" role="application" aria-label="方向摇杆" aria-disabled={disabled}><span className="joystickNorth">↑</span><span className="joystickWest">←</span><span className="joystickEast">→</span><span className="joystickSouth">↓</span></div>;
+}
+
 
 const virtualKeyboardLayout = {
   default: [
@@ -73,6 +121,7 @@ const customVirtualKeyOptions = [
 
 const customVirtualKeyLabels = Object.fromEntries(customVirtualKeyOptions.map(({ button, label }) => [button, label]));
 const customVirtualKeysStorageKey = "mutiny.mobile-control-keys.v1";
+const mobileControlsEnabledStorageKey = "mutiny.mobile-controls-enabled.v1";
 
 const punctuationKeys: Record<string, { code: string; keyCode: number }> = {
   ";": { code: "Semicolon", keyCode: 186 }, "=": { code: "Equal", keyCode: 187 },
@@ -231,6 +280,7 @@ export default function RelayRoom() {
   const [mobileKeyboardOpen, setMobileKeyboardOpen] = useState(false);
   const [mobileKeyEditorOpen, setMobileKeyEditorOpen] = useState(false);
   const [customVirtualKeys, setCustomVirtualKeys] = useState<string[]>([]);
+  const [mobileControlsEnabled, setMobileControlsEnabled] = useState(true);
 
   const roleRef = useRef<AppRole>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -259,6 +309,8 @@ export default function RelayRoom() {
   const pressedVirtualKeysRef = useRef(new Map<string, VirtualKey>());
   const pressedPointerKeysRef = useRef(new Map<number, string>());
   const pressedPhysicalKeysRef = useRef(new Map<string, RemoteEvent>());
+  const remoteTouchGestureRef = useRef<RemoteTouchGesture | null>(null);
+  const joystickDirectionsRef = useRef(new Set<string>());
 
   useEffect(() => {
     const sendReliableRelease = (event: RemoteEvent) => {
@@ -276,7 +328,7 @@ export default function RelayRoom() {
       const button = pressedPointerKeysRef.current.get(event.pointerId);
       if (!button) {
         if (pressedPointerKeysRef.current.size === 0) {
-          for (const name of [...pressedVirtualKeysRef.current.keys()]) releaseVirtualButtonByName(name);
+          for (const name of [...pressedVirtualKeysRef.current.keys()]) if (!joystickDirectionsRef.current.has(name)) releaseVirtualButtonByName(name);
         }
         return;
       }
@@ -290,6 +342,7 @@ export default function RelayRoom() {
       pressedPhysicalKeysRef.current.clear();
       for (const button of [...pressedVirtualKeysRef.current.keys()]) releaseVirtualButtonByName(button);
       pressedPointerKeysRef.current.clear();
+      joystickDirectionsRef.current.clear();
       setKeyboardLayoutName("default");
     };
     const releaseWhenHidden = () => {
@@ -309,6 +362,38 @@ export default function RelayRoom() {
       document.removeEventListener("visibilitychange", releaseWhenHidden);
     };
   }, []);
+  useEffect(() => {
+    const insideMobileControls = (target: EventTarget | null) => target instanceof Element && Boolean(target.closest(".mobileControlOverlay button, .mobileControlOverlay .hg-button, .mobileJoystick"));
+    const suppressNativeMenu = (event: Event) => {
+      if (!insideMobileControls(event.target)) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    const clearNativeSelection = (event: Event) => {
+      if (!insideMobileControls(event.target)) return;
+      window.getSelection()?.removeAllRanges();
+    };
+    document.addEventListener("contextmenu", suppressNativeMenu, true);
+    document.addEventListener("selectstart", suppressNativeMenu, true);
+    document.addEventListener("dragstart", suppressNativeMenu, true);
+    document.addEventListener("pointerdown", clearNativeSelection, true);
+    document.addEventListener("touchstart", clearNativeSelection, true);
+    return () => {
+      document.removeEventListener("contextmenu", suppressNativeMenu, true);
+      document.removeEventListener("selectstart", suppressNativeMenu, true);
+      document.removeEventListener("dragstart", suppressNativeMenu, true);
+      document.removeEventListener("pointerdown", clearNativeSelection, true);
+      document.removeEventListener("touchstart", clearNativeSelection, true);
+    };
+  }, []);
+
+  useEffect(() => {
+    const stored = window.localStorage.getItem(mobileControlsEnabledStorageKey);
+    if (stored !== "false") return;
+    const timer = window.setTimeout(() => setMobileControlsEnabled(false), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
 
   useEffect(() => {
     let restoreTimer: number | undefined;
@@ -354,6 +439,9 @@ export default function RelayRoom() {
     forwardToCompanion(event);
     if (event.type === "pointer") {
       setRemotePointer((old) => ({ ...old, x: event.x ?? 0.5, y: event.y ?? 0.5, visible: true }));
+    } else if (event.type === "scroll") {
+      setRemotePointer((old) => ({ ...old, x: event.x ?? old.x, y: event.y ?? old.y, visible: true }));
+      setLastCommand(`滚动 ${Math.round(event.deltaY ?? 0)} px`);
     } else if (event.type === "click" || event.type === "pointer-down") {
       setRemotePointer({ x: event.x ?? 0.5, y: event.y ?? 0.5, visible: true, click: true });
       setLastCommand(`点击 ${Math.round((event.x ?? 0) * 100)}% × ${Math.round((event.y ?? 0) * 100)}%`);
@@ -652,7 +740,7 @@ export default function RelayRoom() {
       : state?.phase === "playing";
     if (peerRole !== "controller" || !allowed) return;
     const payload = JSON.stringify(event);
-    if (event.type === "pointer") {
+    if (event.type === "pointer" || event.type === "scroll") {
       const pointerChannels = [...pointerChannelsRef.current.values()].filter((channel) => channel.readyState === "open");
       if (pointerChannels.length) return pointerChannels.forEach((channel) => channel.send(payload));
     }
@@ -668,10 +756,8 @@ export default function RelayRoom() {
     sendControl(payload);
   };
 
-  const pointerEvent = (event: React.PointerEvent<HTMLDivElement>, type: "pointer" | "pointer-down" | "pointer-up") => {
-    if (type === "pointer" && performance.now() - pointerAtRef.current < 32) return;
-    pointerAtRef.current = performance.now();
-    const rect = event.currentTarget.getBoundingClientRect();
+  const remotePoint = (element: HTMLDivElement, clientX: number, clientY: number) => {
+    const rect = element.getBoundingClientRect();
     const video = remoteVideoRef.current;
     const sourceAspect = video?.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : videoAspect;
     const boxAspect = rect.width / rect.height;
@@ -679,18 +765,74 @@ export default function RelayRoom() {
     const contentHeight = boxAspect > sourceAspect ? rect.height : rect.width / sourceAspect;
     const contentLeft = rect.left + (rect.width - contentWidth) / 2;
     const contentTop = rect.top + (rect.height - contentHeight) / 2;
-    const x = (event.clientX - contentLeft) / contentWidth;
-    const y = (event.clientY - contentTop) / contentHeight;
-    const outside = x < 0 || x > 1 || y < 0 || y > 1;
-    if (outside && (type === "pointer-down" || (type === "pointer" && event.buttons === 0))) return;
-    sendControl({
-      type,
-      x: Math.max(0, Math.min(1, x)),
-      y: Math.max(0, Math.min(1, y)),
-      button: event.button,
-      buttons: event.buttons,
-    });
+    const rawX = (clientX - contentLeft) / contentWidth;
+    const rawY = (clientY - contentTop) / contentHeight;
+    return { x: Math.max(0, Math.min(1, rawX)), y: Math.max(0, Math.min(1, rawY)), outside: rawX < 0 || rawX > 1 || rawY < 0 || rawY > 1 };
   };
+
+  const pointerEvent = (event: React.PointerEvent<HTMLDivElement>, type: "pointer" | "pointer-down" | "pointer-up") => {
+    const eventAt = event.timeStamp;
+    if (type === "pointer" && eventAt - pointerAtRef.current < 32) return;
+    pointerAtRef.current = eventAt;
+    const point = remotePoint(event.currentTarget, event.clientX, event.clientY);
+    if (point.outside && (type === "pointer-down" || (type === "pointer" && event.buttons === 0))) return;
+    sendControl({ type, x: point.x, y: point.y, button: event.button, buttons: event.buttons });
+  };
+
+  const remotePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.currentTarget.focus();
+    if (event.pointerType !== "touch") {
+      event.currentTarget.setPointerCapture(event.pointerId);
+      pointerEvent(event, "pointer-down");
+      return;
+    }
+    const point = remotePoint(event.currentTarget, event.clientX, event.clientY);
+    if (point.outside) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    remoteTouchGestureRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, lastX: event.clientX, lastY: event.clientY, mode: "pending", startPoint: point };
+    sendControl({ type: "pointer", x: point.x, y: point.y, buttons: 0 });
+  };
+
+  const remotePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType !== "touch") return pointerEvent(event, "pointer");
+    const gesture = remoteTouchGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const totalX = event.clientX - gesture.startX;
+    const totalY = event.clientY - gesture.startY;
+    if (gesture.mode === "pending") {
+      if (Math.hypot(totalX, totalY) < 10) return;
+      gesture.mode = Math.abs(totalY) >= Math.abs(totalX) * 1.15 ? "scroll" : "pointer";
+      if (gesture.mode === "pointer") sendControl({ type: "pointer-down", ...gesture.startPoint, button: 0, buttons: 1 });
+    }
+    const point = remotePoint(event.currentTarget, event.clientX, event.clientY);
+    if (gesture.mode === "scroll") {
+      const deltaY = -(event.clientY - gesture.lastY) * 1.55;
+      if (Math.abs(deltaY) >= 0.5) sendControl({ type: "scroll", x: point.x, y: point.y, deltaX: 0, deltaY });
+    } else {
+      sendControl({ type: "pointer", x: point.x, y: point.y, button: 0, buttons: 1 });
+    }
+    gesture.lastX = event.clientX;
+    gesture.lastY = event.clientY;
+  };
+
+  const finishRemotePointer = (event: React.PointerEvent<HTMLDivElement>, cancelled = false) => {
+    event.preventDefault();
+    if (event.pointerType !== "touch") {
+      pointerEvent(event, "pointer-up");
+    } else {
+      const gesture = remoteTouchGestureRef.current;
+      if (gesture?.pointerId === event.pointerId) {
+        const point = remotePoint(event.currentTarget, event.clientX, event.clientY);
+        if (gesture.mode === "pointer") sendControl({ type: "pointer-up", x: point.x, y: point.y, button: 0, buttons: 0 });
+        else if (gesture.mode === "pending" && !cancelled) sendControl({ type: "click", x: point.x, y: point.y, button: 0, buttons: 0 });
+        remoteTouchGestureRef.current = null;
+      }
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
 
   const sendCaptureInfo = (video?: HTMLVideoElement | null) => {
     const track = streamRef.current?.getVideoTracks()[0];
@@ -736,13 +878,13 @@ export default function RelayRoom() {
     companionRef.current = socket;
     socket.onopen = () => {
       if (companionAttemptRef.current !== attempt) return socket.close();
-      socket.send(JSON.stringify({ type: "auth", code: companionCode.trim(), protocols: ["mutiny-input-v6", "cdp-page-v5"] }));
+      socket.send(JSON.stringify({ type: "auth", code: companionCode.trim(), protocols: ["mutiny-input-v7", "mutiny-input-v6", "cdp-page-v5"] }));
     };
     socket.onmessage = (event) => {
       if (companionAttemptRef.current !== attempt) return;
       const message = JSON.parse(event.data);
       if (message.type === "auth-ok") {
-        if (message.protocol !== "mutiny-input-v6") {
+        if (message.protocol !== "mutiny-input-v7") {
           socket.close();
           setCompanionState("off");
           setNotice("检测到旧版助手仍在运行。请在旧终端按 Ctrl+C，再重新运行 npm run companion:arm。");
@@ -896,6 +1038,28 @@ export default function RelayRoom() {
       setKeyboardLayoutName("default");
     }
   };
+  const updateJoystickDirections = (directions: string[]) => {
+    const next = new Set(directions);
+    for (const button of joystickDirectionsRef.current) {
+      if (!next.has(button)) releaseVirtualKey(button);
+    }
+    for (const button of next) {
+      if (!joystickDirectionsRef.current.has(button)) pressVirtualKey(button);
+    }
+    joystickDirectionsRef.current = next;
+  };
+
+  const toggleMobileControls = () => {
+    const enabled = !mobileControlsEnabled;
+    if (!enabled) {
+      updateJoystickDirections([]);
+      setMobileKeyboardOpen(false);
+      setMobileKeyEditorOpen(false);
+    }
+    setMobileControlsEnabled(enabled);
+    window.localStorage.setItem(mobileControlsEnabledStorageKey, String(enabled));
+  };
+
 
   const pressVirtualButton = (event: ReactPointerEvent<HTMLButtonElement>, button: string) => {
     event.preventDefault();
@@ -1112,10 +1276,10 @@ export default function RelayRoom() {
             <div className="videoViewport" ref={videoViewportRef}>
               {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex -- 这是接收完整鼠标与键盘输入的远程应用画布。 */}
               <div className={`videoWrap ${role === "guest" ? canGuestControl ? "controlActive" : "controlLocked" : ""}`} role="application" aria-label={role === "guest" ? canGuestControl ? "远程控制画面" : "只读实时画面" : "房主共享画面"} style={{ aspectRatio: videoAspect, width: role === "guest" ? `${zoom * 100}%` : "100%" }} tabIndex={canGuestControl ? 0 : -1}
-                onPointerMove={canGuestControl ? (event) => pointerEvent(event, "pointer") : undefined}
-                onPointerDown={canGuestControl ? (event) => { event.preventDefault(); event.currentTarget.focus(); event.currentTarget.setPointerCapture(event.pointerId); pointerEvent(event, "pointer-down"); } : undefined}
-                onPointerUp={canGuestControl ? (event) => { event.preventDefault(); pointerEvent(event, "pointer-up"); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); } : undefined}
-                onPointerCancel={canGuestControl ? (event) => pointerEvent(event, "pointer-up") : undefined}
+                onPointerMove={canGuestControl ? remotePointerMove : undefined}
+                onPointerDown={canGuestControl ? remotePointerDown : undefined}
+                onPointerUp={canGuestControl ? (event) => finishRemotePointer(event) : undefined}
+                onPointerCancel={canGuestControl ? (event) => finishRemotePointer(event, true) : undefined}
                 onContextMenu={canGuestControl ? (event) => event.preventDefault() : undefined}
                 onKeyDown={canGuestControl ? (event) => physicalKeyEvent(event, "key-down") : undefined}
                 onKeyUp={canGuestControl ? (event) => physicalKeyEvent(event, "key-up") : undefined}>
@@ -1125,29 +1289,24 @@ export default function RelayRoom() {
                 {role === "host" && remotePointer.visible && <div className={`remoteCursor ${remotePointer.click ? "clicking" : ""}`} style={{ left: `${remotePointer.x * 100}%`, top: `${remotePointer.y * 100}%` }}><span>远程</span></div>}
                 {role === "guest" && !connected && <div className="videoPlaceholder"><div className="radar"><span>◎</span></div><strong>{status}</strong><small>连接建立后画面会自动出现</small></div>}
               </div>
-              {role === "guest" && <div className={`mobileControlOverlay ${canGuestControl ? "" : "disabled"} ${mobileKeyboardOpen || mobileKeyEditorOpen ? "panelOpen" : ""}`} aria-label="悬浮触屏控制" onContextMenu={(event) => event.preventDefault()} onDragStart={(event) => event.preventDefault()}>
+              {role === "guest" && <div className={`mobileControlOverlay ${canGuestControl ? "" : "disabled"} ${mobileControlsEnabled ? "" : "controlsHidden"} ${mobileControlsEnabled && (mobileKeyboardOpen || mobileKeyEditorOpen) ? "panelOpen" : ""}`} aria-label="悬浮触屏控制" onDragStart={(event) => event.preventDefault()}>
                 <div className="mobileControlToolbar">
-                  <button type="button" aria-expanded={mobileKeyboardOpen} onClick={() => { setMobileKeyboardOpen((open) => !open); setMobileKeyEditorOpen(false); }}>⌨ 键盘</button>
-                  <button type="button" aria-expanded={mobileKeyEditorOpen} onClick={() => { setMobileKeyEditorOpen((open) => !open); setMobileKeyboardOpen(false); }}>⚙ 按键</button>
+                  <button type="button" className="mobileControlsToggle" aria-pressed={mobileControlsEnabled} onClick={toggleMobileControls}>{mobileControlsEnabled ? "🎮 隐藏按键" : "🎮 显示按键"}</button>
+                  {mobileControlsEnabled && <button type="button" aria-expanded={mobileKeyboardOpen} onClick={() => { setMobileKeyboardOpen((open) => !open); setMobileKeyEditorOpen(false); }}>⌨ 键盘</button>}
+                  {mobileControlsEnabled && <button type="button" aria-expanded={mobileKeyEditorOpen} onClick={() => { setMobileKeyEditorOpen((open) => !open); setMobileKeyboardOpen(false); }}>⚙ 按键</button>}
                 </div>
-                <div className="mobileQuickControls">
-                  <div className="mobileDpad" aria-label="方向键">
-                    <button type="button" className="dpadUp" aria-label="方向上" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{arrowup}")} onPointerUp={(event) => releaseVirtualButton(event, "{arrowup}")} onPointerCancel={(event) => releaseVirtualButton(event, "{arrowup}")}>↑</button>
-                    <button type="button" className="dpadLeft" aria-label="方向左" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{arrowleft}")} onPointerUp={(event) => releaseVirtualButton(event, "{arrowleft}")} onPointerCancel={(event) => releaseVirtualButton(event, "{arrowleft}")}>←</button>
-                    <span aria-hidden="true" />
-                    <button type="button" className="dpadRight" aria-label="方向右" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{arrowright}")} onPointerUp={(event) => releaseVirtualButton(event, "{arrowright}")} onPointerCancel={(event) => releaseVirtualButton(event, "{arrowright}")}>→</button>
-                    <button type="button" className="dpadDown" aria-label="方向下" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{arrowdown}")} onPointerUp={(event) => releaseVirtualButton(event, "{arrowdown}")} onPointerCancel={(event) => releaseVirtualButton(event, "{arrowdown}")}>↓</button>
-                  </div>
+                {mobileControlsEnabled && <div className="mobileQuickControls">
+                  <MobileJoystick disabled={!canGuestControl} onDirectionChange={updateJoystickDirections} />
                   <div className="mobileActionCluster">
-                    {customVirtualKeys.length > 0 && <div className="mobileCustomKeys">{customVirtualKeys.map((button) => <button type="button" key={button} disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, button)} onPointerUp={(event) => releaseVirtualButton(event, button)} onPointerCancel={(event) => releaseVirtualButton(event, button)}>{customVirtualKeyLabels[button]}</button>)}</div>}
+                    {customVirtualKeys.length > 0 && <div className="mobileCustomKeys">{customVirtualKeys.map((button) => <button type="button" draggable={false} key={button} disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, button)} onPointerUp={(event) => releaseVirtualButton(event, button)} onPointerCancel={(event) => releaseVirtualButton(event, button)}>{customVirtualKeyLabels[button]}</button>)}</div>}
                     <div className="mobileDefaultActions">
-                      <button type="button" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{esc}")} onPointerUp={(event) => releaseVirtualButton(event, "{esc}")} onPointerCancel={(event) => releaseVirtualButton(event, "{esc}")}>ESC</button>
-                      <button type="button" className="mobileSpaceButton" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{space}")} onPointerUp={(event) => releaseVirtualButton(event, "{space}")} onPointerCancel={(event) => releaseVirtualButton(event, "{space}")}>SPACE</button>
-                      <button type="button" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{enter}")} onPointerUp={(event) => releaseVirtualButton(event, "{enter}")} onPointerCancel={(event) => releaseVirtualButton(event, "{enter}")}>ENTER</button>
+                      <button type="button" draggable={false} disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{esc}")} onPointerUp={(event) => releaseVirtualButton(event, "{esc}")} onPointerCancel={(event) => releaseVirtualButton(event, "{esc}")}>ESC</button>
+                      <button type="button" draggable={false} className="mobileSpaceButton" disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{space}")} onPointerUp={(event) => releaseVirtualButton(event, "{space}")} onPointerCancel={(event) => releaseVirtualButton(event, "{space}")}>SPACE</button>
+                      <button type="button" draggable={false} disabled={!canGuestControl} onPointerDown={(event) => pressVirtualButton(event, "{enter}")} onPointerUp={(event) => releaseVirtualButton(event, "{enter}")} onPointerCancel={(event) => releaseVirtualButton(event, "{enter}")}>ENTER</button>
                     </div>
                   </div>
-                </div>
-                {mobileKeyboardOpen && <div className="mobileControlPanel mobileKeyboardPanel">
+                </div>}
+                {mobileControlsEnabled && mobileKeyboardOpen && <div className="mobileControlPanel mobileKeyboardPanel">
                   <div className="mobileKeyboardHeader"><strong>完整键盘</strong><button type="button" aria-label="关闭完整键盘" onClick={() => setMobileKeyboardOpen(false)}>×</button></div>
                   <Keyboard
                     layout={virtualKeyboardLayout}
@@ -1171,9 +1330,9 @@ export default function RelayRoom() {
                   />
                   <input aria-label="使用系统键盘发送文字到远端应用" disabled={!canGuestControl} inputMode="text" enterKeyHint="done" placeholder="点此使用手机系统键盘输入文字" onInput={(event) => { const inputEvent = event.nativeEvent as InputEvent; if (inputEvent.isComposing) return; sendRemoteText(event.currentTarget.value); event.currentTarget.value = ""; }} />
                 </div>}
-                {mobileKeyEditorOpen && <div className="mobileControlPanel mobileKeyEditor">
+                {mobileControlsEnabled && mobileKeyEditorOpen && <div className="mobileControlPanel mobileKeyEditor">
                   <div className="mobileKeyboardHeader"><strong>自定义悬浮按键</strong><button type="button" aria-label="关闭按键编辑器" onClick={() => setMobileKeyEditorOpen(false)}>×</button></div>
-                  <p>选择最多 12 个游戏按键；方向键、Enter、Esc 和 Space 会始终显示。</p>
+                  <p>选择最多 12 个游戏按键；摇杆、Enter、Esc 和 Space 会随“显示按键”一起出现。</p>
                   <div className="mobileKeyPicker">{customVirtualKeyOptions.map(({ button, label }) => {
                     const selected = customVirtualKeys.includes(button);
                     return <button type="button" key={button} className={selected ? "selected" : ""} aria-pressed={selected} disabled={!selected && customVirtualKeys.length >= 12} onClick={() => toggleCustomVirtualKey(button)}>{label}</button>;

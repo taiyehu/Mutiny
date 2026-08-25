@@ -75,6 +75,9 @@ export class WindowsNativeHost {
   pointer(handle, message, action, surface = "window") {
     return this.send({ command: "pointer", handle, x: Number(message.x), y: Number(message.y), button: Number(message.button) || 0, action, surface });
   }
+  scroll(handle, message, surface = "window") {
+    return this.send({ command: "scroll", handle, x: Number(message.x), y: Number(message.y), deltaX: Number(message.deltaX) || 0, deltaY: Number(message.deltaY) || 0, surface });
+  }
   key(handle, virtualKey, code, down) { return this.send({ command: "key", handle, virtualKey, code, down }); }
   text(handle, text) { return this.send({ command: "text", handle, text: String(text || "") }); }
   close() { this.process?.kill(); this.process = null; }

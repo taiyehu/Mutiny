@@ -229,6 +229,7 @@ async function dispatchInput(message, dispatchTarget = target) {
     if (message.type === "pointer-down") return nativeHost.pointer(dispatchTarget.handle, normalized, "down", captureInfo.surface);
     if (message.type === "pointer-up") return nativeHost.pointer(dispatchTarget.handle, normalized, "up", captureInfo.surface);
     if (message.type === "click") return nativeHost.pointer(dispatchTarget.handle, normalized, "click", captureInfo.surface);
+    if (message.type === "scroll") return nativeHost.scroll(dispatchTarget.handle, normalized, captureInfo.surface);
     if (message.type === "text") {
       const text = String(message.text || "");
       if (text) await nativeHost.text(dispatchTarget.handle, text);
@@ -259,13 +260,15 @@ async function dispatchInput(message, dispatchTarget = target) {
       }
       return;
     }
-    if (["pointer", "pointer-down", "pointer-up", "click"].includes(message.type)) {
+    if (["pointer", "pointer-down", "pointer-up", "click", "scroll"].includes(message.type)) {
       const viewport = await dispatchTarget.getViewport();
       const normalizedX = Number(message.x) * coordinateMap.scaleX + coordinateMap.offsetX;
       const normalizedY = Number(message.y) * coordinateMap.scaleY + coordinateMap.offsetY;
       const x = Math.max(0, Math.min(viewport.width - 1, normalizedX * viewport.width));
       const y = Math.max(0, Math.min(viewport.height - 1, normalizedY * viewport.height));
-      if (message.type === "pointer") {
+      if (message.type === "scroll") {
+        await dispatchTarget.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: Number(message.deltaX) || 0, deltaY: Number(message.deltaY) || 0, modifiers: modifierMask(message) });
+      } else if (message.type === "pointer") {
         await dispatchTarget.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none", buttons: Number(message.buttons) || 0, modifiers: modifierMask(message) });
       } else {
         const button = ["left", "middle", "right"][Number(message.button) || 0] || "left";
@@ -445,6 +448,31 @@ wss.on("connection", (socket) => {
       },
     );
   };
+  let pendingScroll = null;
+  let scrollScheduled = false;
+  const scheduleScroll = () => {
+    if (scrollScheduled) return;
+    scrollScheduled = true;
+    const queuedScroll = inputQueue.catch(() => {}).then(async () => {
+      const latest = pendingScroll;
+      pendingScroll = null;
+      if (!latest) return;
+      if (armed) await dispatchInput(latest);
+    });
+    inputQueue = queuedScroll;
+    void queuedScroll.then(
+      () => {
+        scrollScheduled = false;
+        if (pendingScroll) scheduleScroll();
+      },
+      (error) => {
+        scrollScheduled = false;
+        reply(socket, { type: "input-error", operation: "scroll", message: error.message });
+        if (pendingScroll) scheduleScroll();
+      },
+    );
+  };
+
   socket.on("message", async (raw) => {
     let message;
     try { message = JSON.parse(raw.toString()); } catch { return; }
@@ -462,7 +490,9 @@ wss.on("connection", (socket) => {
       controller = socket;
       authenticated = true;
       const requestedProtocols = Array.isArray(message.protocols) ? message.protocols.map(String) : [];
-      const negotiatedProtocol = requestedProtocols.includes("mutiny-input-v6") ? "mutiny-input-v6" : "cdp-page-v5";
+      const negotiatedProtocol = requestedProtocols.includes("mutiny-input-v7")
+        ? "mutiny-input-v7"
+        : requestedProtocols.includes("mutiny-input-v6") ? "mutiny-input-v6" : "cdp-page-v5";
       reply(socket, { type: "auth-ok", protocol: negotiatedProtocol, capabilities: { browser: true, nativeWindows: process.platform === "win32" } });
       await sendTargets(socket);
       console.log("房主页面已连接。请选择浏览器标签页或 Windows 应用窗口；按 Ctrl+C 可立即停止。");
@@ -554,6 +584,13 @@ wss.on("connection", (socket) => {
         schedulePointerMove();
         return;
       }
+      if (message.type === "scroll" && !calibration) {
+        const deltaX = (Number(pendingScroll?.deltaX) || 0) + (Number(message.deltaX) || 0);
+        const deltaY = (Number(pendingScroll?.deltaY) || 0) + (Number(message.deltaY) || 0);
+        pendingScroll = { ...message, deltaX: Math.max(-1200, Math.min(1200, deltaX)), deltaY: Math.max(-1200, Math.min(1200, deltaY)) };
+        scheduleScroll();
+        return;
+      }
       if (["pointer", "pointer-down", "pointer-up", "click", "key", "key-down", "key-up", "text"].includes(message.type)) {
         inputQueue = inputQueue.catch(() => {}).then(async () => {
           if (calibration) await handleCalibration(message, socket);
@@ -578,6 +615,7 @@ wss.on("connection", (socket) => {
       target = null;
       calibration = null;
       pendingPointerMove = null;
+      pendingScroll = null;
       void releaseTarget(previousTarget);
     }
   });

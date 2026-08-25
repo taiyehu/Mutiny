@@ -102,8 +102,9 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(page, /customVirtualKeysStorageKey/);
   assert.match(page, /document\.fullscreenElement/);
   assert.match(page, /onPointerCancel/);
-  assert.ok(page.indexOf('className="videoViewport"') < page.indexOf("mobileControlOverlay"));
-  assert.ok(page.indexOf("mobileControlOverlay") < page.indexOf('className="commandLog"'));
+  const mobileOverlayMarkup = page.indexOf('className={`mobileControlOverlay');
+  assert.ok(page.indexOf('className="videoViewport"') < mobileOverlayMarkup);
+  assert.ok(mobileOverlayMarkup < page.indexOf('className="commandLog"'));
   assert.match(styles, /\.videoViewport:fullscreen/);
   assert.match(styles, /\.mobileControlOverlay/);
   assert.match(page, /jitterBufferTarget\s*=\s*20/);
@@ -132,6 +133,16 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(page, /pressedPhysicalKeysRef/);
   assert.match(companion, /pendingPointerMove/);
   assert.match(companion, /schedulePointerMove/);
+  assert.match(page, /MobileJoystick/);
+  assert.match(page, /mobileControlsEnabledStorageKey/);
+  assert.match(page, /mode === "scroll"/);
+  assert.match(page, /selectstart/);
+  assert.match(styles, /\.mobileJoystick/);
+  assert.match(styles, /-moz-user-select:none!important/);
+  assert.match(companion, /mouseWheel/);
+  assert.match(companion, /pendingScroll/);
+  assert.match(companion, /scheduleScroll/);
+  assert.match(packageJson, /"nipplejs": "1\.0\.4"/);
   assert.match(page, /TURN 已就绪/);
   assert.doesNotMatch(page, /红蓝|红方|蓝方|回合对战|turnSecondsLeft/);
   assert.match(page, /校准由房主控制/);
@@ -156,6 +167,9 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(companion, /set-capture-info/);
   assert.match(nativeHost, /0x0004u/);
   assert.match(nativeHost, /SendMouseButton/);
+  assert.match(nativeHost, /SendWheel/);
+  assert.match(nativeHost, /0x0800u/);
+  assert.match(nativeHost, /"scroll"/);
   assert.match(page, /displaySurface/);
   assert.match(nativeHost, /"activate"/);
   assert.match(signal, /只有房主可以发起校准/);
