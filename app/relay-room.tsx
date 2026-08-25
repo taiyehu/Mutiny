@@ -11,7 +11,7 @@ type PeerRole = "controller" | "spectator";
 type Peer = { peerId: string; name: string; role: PeerRole; approved: boolean };
 type RemoteEvent = { type: "pointer" | "pointer-down" | "pointer-up" | "click" | "scroll" | "key" | "key-down" | "key-up" | "text"; x?: number; y?: number; button?: number; buttons?: number; deltaX?: number; deltaY?: number; key?: string; code?: string; keyCode?: number; location?: number; repeat?: boolean; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; text?: string };
 type ControlTarget = { id: string; title: string; url: string; kind: "browser" | "window"; width?: number; height?: number };
-type Quality = { rtt: number | null; videoDelay: number | null; jitterBuffer: number | null; jitterBufferMinimum: number | null; jitterBufferTarget: number | null; decodeTime: number | null; bitrate: number; fps: number | null; lost: number; codec: string | null; width: number | null; height: number | null; dropped: number; freezes: number; nack: number; pli: number };
+type Quality = { rtt: number | null; videoDelay: number | null; jitterBuffer: number | null; jitterBufferMinimum: number | null; jitterBufferTarget: number | null; decodeTime: number | null; bitrate: number; fps: number | null; lost: number; codec: string | null; width: number | null; height: number | null; dropped: number; freezes: number; nack: number; pli: number; audioJitterBuffer: number | null; audioJitterMinimum: number | null; audioJitterTarget: number | null; audioBitrate: number; audioLost: number; audioCodec: string | null; avSyncOffset: number | null };
 type VideoProfileKey = "low-latency" | "smooth" | "quality";
 type VideoProfile = { label: string; detail: string; width: number; height: number; frameRate: number; maxBitrate: number; preferH264: boolean };
 type IceServerMessage = { type: "ice-servers"; iceServers: RTCIceServer[]; turnEnabled: boolean; error?: string | null };
@@ -25,6 +25,7 @@ const videoProfiles: Record<VideoProfileKey, VideoProfile> = {
   smooth: { label: "高帧率", detail: "720p · 60 fps · 最高 5 Mbps · H.264 优先", width: 1280, height: 720, frameRate: 60, maxBitrate: 5_000_000, preferH264: true },
   quality: { label: "高清晰度", detail: "1080p · 30 fps · 最高 6 Mbps", width: 1920, height: 1080, frameRate: 30, maxBitrate: 6_000_000, preferH264: false },
 };
+const emptyQuality = (): Quality => ({ rtt: null, videoDelay: null, jitterBuffer: null, jitterBufferMinimum: null, jitterBufferTarget: null, decodeTime: null, bitrate: 0, fps: null, lost: 0, codec: null, width: null, height: null, dropped: 0, freezes: 0, nack: 0, pli: 0, audioJitterBuffer: null, audioJitterMinimum: null, audioJitterTarget: null, audioBitrate: 0, audioLost: 0, audioCodec: null, avSyncOffset: null });
 
 
 type VirtualKey = { key: string; code: string; keyCode: number; shiftKey?: boolean };
@@ -212,13 +213,14 @@ function preferH264Video(pc: RTCPeerConnection, sender: RTCRtpSender, profile: V
   }
 }
 
-function preferLowLatencyPlayback(receiver: RTCRtpReceiver) {
+function preferLowLatencyPlayback(receiver: RTCRtpReceiver, kind: MediaStreamTrack["kind"]) {
   const configurable = receiver as LowLatencyReceiver;
   try {
-    if ("jitterBufferTarget" in configurable) configurable.jitterBufferTarget = 20;
+    if ("jitterBufferTarget" in configurable) configurable.jitterBufferTarget = kind === "video" ? 0 : 80;
   } catch (error) {
     console.warn("无法设置标准接收缓冲目标，将继续尝试浏览器兼容接口。", error);
   }
+  if (kind !== "video") return;
   try {
     if ("playoutDelayHint" in configurable) configurable.playoutDelayHint = 0;
   } catch (error) {
@@ -258,7 +260,7 @@ export default function RelayRoom() {
   const [status, setStatus] = useState("本地服务未连接");
   const [notice, setNotice] = useState("");
   const [peers, setPeers] = useState<Peer[]>([]);
-  const [quality, setQuality] = useState<Quality>({ rtt: null, videoDelay: null, jitterBuffer: null, jitterBufferMinimum: null, jitterBufferTarget: null, decodeTime: null, bitrate: 0, fps: null, lost: 0, codec: null, width: null, height: null, dropped: 0, freezes: 0, nack: 0, pli: 0 });
+  const [quality, setQuality] = useState<Quality>(emptyQuality);
   const [videoAspect, setVideoAspect] = useState(16 / 9);
   const [remotePointer, setRemotePointer] = useState({ x: 0.5, y: 0.5, visible: false, click: false });
   const [lastCommand, setLastCommand] = useState("等待访客操作");
@@ -282,12 +284,14 @@ export default function RelayRoom() {
   const [mobileKeyEditorOpen, setMobileKeyEditorOpen] = useState(false);
   const [customVirtualKeys, setCustomVirtualKeys] = useState<string[]>([]);
   const [mobileControlsEnabled, setMobileControlsEnabled] = useState(true);
+  const [audioPlaybackBlocked, setAudioPlaybackBlocked] = useState(false);
 
   const roleRef = useRef<AppRole>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const pcsRef = useRef(new Map<string, RTCPeerConnection>());
   const channelsRef = useRef(new Map<string, RTCDataChannel>());
   const pointerChannelsRef = useRef(new Map<string, RTCDataChannel>());
@@ -298,6 +302,7 @@ export default function RelayRoom() {
   const calibrationActiveRef = useRef(false);
   const videoViewportRef = useRef<HTMLDivElement | null>(null);
   const statsPreviousRef = useRef(new Map<string, { bytes: number; at: number; jitterDelay: number; jitterMinimumDelay: number | null; jitterTargetDelay: number | null; jitterCount: number; decodeTime: number | null; decodedFrames: number; lost: number; dropped: number; freezes: number; nack: number; pli: number }>());
+  const audioStatsPreviousRef = useRef(new Map<string, { bytes: number; at: number; jitterDelay: number; jitterMinimumDelay: number | null; jitterTargetDelay: number | null; jitterCount: number; lost: number }>());
   const videoDelayRef = useRef<number | null>(null);
   const pointerAtRef = useRef(0);
   const rtcConfigRef = useRef<RTCConfiguration>(defaultRtcConfig());
@@ -477,8 +482,18 @@ export default function RelayRoom() {
       if (event.candidate) sendSignal({ type: "signal", target: peerId, data: { candidate: event.candidate.toJSON() } });
     };
     pc.ontrack = (event) => {
-      preferLowLatencyPlayback(event.receiver);
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = event.streams[0];
+      preferLowLatencyPlayback(event.receiver, event.track.kind);
+      const isolatedStream = new MediaStream([event.track]);
+      if (event.track.kind === "video") {
+        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = isolatedStream;
+        return;
+      }
+      if (event.track.kind === "audio" && remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = isolatedStream;
+        void remoteAudioRef.current.play()
+          .then(() => setAudioPlaybackBlocked(false))
+          .catch(() => setAudioPlaybackBlocked(true));
+      }
     };
     pc.onconnectionstatechange = () => {
       const active = [...pcsRef.current.values()].filter((item) => item.connectionState === "connected").length;
@@ -495,7 +510,7 @@ export default function RelayRoom() {
     if (pcsRef.current.has(peerId) || !streamRef.current) return;
     const pc = new RTCPeerConnection(rtcConfigRef.current);
     bindPeer(peerId, pc);
-    const senders = streamRef.current.getTracks().map((track) => pc.addTrack(track, streamRef.current!));
+    const senders = streamRef.current.getTracks().map((track) => pc.addTrack(track, new MediaStream([track])));
     senders.filter((sender) => sender.track?.kind === "video").forEach((sender) => preferH264Video(pc, sender, videoProfiles[videoProfile]));
     await Promise.all(senders.filter((sender) => sender.track?.kind === "video").map((sender) => preferSmoothVideo(sender, videoProfiles[videoProfile])));
     // Keyboard and mouse button transitions must arrive in order. Losing a key-up
@@ -540,10 +555,13 @@ export default function RelayRoom() {
     channelsRef.current.clear(); pointerChannelsRef.current.clear();
     candidateQueueRef.current.clear();
     statsPreviousRef.current.clear();
+    audioStatsPreviousRef.current.clear();
     videoDelayRef.current = null;
     setConnectedPeers(0);
     setRemotePointer((old) => ({ ...old, visible: false, click: false }));
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+    setAudioPlaybackBlocked(false);
   }, []);
 
   const connectSignaling = useCallback(() => new Promise<WebSocket>((resolve, reject) => {
@@ -1116,7 +1134,10 @@ export default function RelayRoom() {
     wsRef.current = null; companionRef.current = null; streamRef.current = null;
     pcsRef.current.clear(); channelsRef.current.clear(); pointerChannelsRef.current.clear(); candidateQueueRef.current.clear();
     statsPreviousRef.current.clear();
+    audioStatsPreviousRef.current.clear();
     videoDelayRef.current = null;
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+    setAudioPlaybackBlocked(false);
     peersRef.current = []; selfPeerIdRef.current = ""; controlRef.current = null; desktopControlEnabledRef.current = false; calibrationActiveRef.current = false; turnEnabledRef.current = false; rtcConfigRef.current = defaultRtcConfig(); pressedVirtualKeysRef.current.clear(); pressedPointerKeysRef.current.clear(); pressedPhysicalKeysRef.current.clear(); setKeyboardLayoutName("default"); setDesktopControlEnabled(false); setBrowserTargets([]); setBrowserTargetId(""); setBrowserTargetReady(false); setBrowserViewport(null); setCalibrationState("off"); setZoom(1); setRole(null); roleRef.current = null; setRoomCode(""); setSelfPeerId(""); setControl(null); setPeers([]); setConnectedPeers(0); setTurnStatus("正在检查 ICE"); setMediaPath("等待连接"); setStatus("本地服务未连接"); setNotice(""); setCompanionState("off");
   }, []);
 
@@ -1167,13 +1188,17 @@ export default function RelayRoom() {
     if (!role) return;
     const timer = window.setInterval(async () => {
       const entry = [...pcsRef.current.entries()][0];
-      if (!entry) return setQuality({ rtt: null, videoDelay: null, jitterBuffer: null, jitterBufferMinimum: null, jitterBufferTarget: null, decodeTime: null, bitrate: 0, fps: null, lost: 0, codec: null, width: null, height: null, dropped: 0, freezes: 0, nack: 0, pli: 0 });
+      if (!entry) return setQuality(emptyQuality());
       const [peerId, pc] = entry;
       const reports = await pc.getStats();
       let bytes = 0, fps: number | null = null, lost = 0, rtt: number | null = null;
       let jitterDelay = 0, jitterCount = 0, decodedFrames = 0;
       let dropped = 0, freezes = 0, nack = 0, pli = 0, codecId = "", width: number | null = null, height: number | null = null;
       let jitterMinimumDelay: number | null = null, jitterTargetDelay: number | null = null, decodeTime: number | null = null;
+      let videoEstimatedPlayout: number | null = null;
+      let audioBytes = 0, audioLost = 0, audioCodecId = "";
+      let audioJitterDelay = 0, audioJitterCount = 0;
+      let audioJitterMinimumDelay: number | null = null, audioJitterTargetDelay: number | null = null, audioEstimatedPlayout: number | null = null;
       let selectedPair;
       reports.forEach((report) => {
         if ((report.type === "inbound-rtp" || report.type === "outbound-rtp") && report.kind === "video") {
@@ -1185,6 +1210,17 @@ export default function RelayRoom() {
             if (typeof report.jitterBufferTargetDelay === "number") jitterTargetDelay = (jitterTargetDelay ?? 0) + report.jitterBufferTargetDelay;
             if (typeof report.totalDecodeTime === "number") decodeTime = (decodeTime ?? 0) + report.totalDecodeTime; decodedFrames += report.framesDecoded ?? 0;
             dropped += report.framesDropped ?? 0; freezes += report.freezeCount ?? 0; nack += report.nackCount ?? 0; pli += report.pliCount ?? 0;
+            if (typeof report.estimatedPlayoutTimestamp === "number") videoEstimatedPlayout = report.estimatedPlayoutTimestamp;
+          }
+        }
+        if ((report.type === "inbound-rtp" || report.type === "outbound-rtp") && report.kind === "audio") {
+          audioBytes += report.bytesReceived ?? report.bytesSent ?? 0; audioLost += report.packetsLost ?? 0;
+          audioCodecId = report.codecId ?? audioCodecId;
+          if (report.type === "inbound-rtp") {
+            audioJitterDelay += report.jitterBufferDelay ?? 0; audioJitterCount += report.jitterBufferEmittedCount ?? 0;
+            if (typeof report.jitterBufferMinimumDelay === "number") audioJitterMinimumDelay = (audioJitterMinimumDelay ?? 0) + report.jitterBufferMinimumDelay;
+            if (typeof report.jitterBufferTargetDelay === "number") audioJitterTargetDelay = (audioJitterTargetDelay ?? 0) + report.jitterBufferTargetDelay;
+            if (typeof report.estimatedPlayoutTimestamp === "number") audioEstimatedPlayout = report.estimatedPlayoutTimestamp;
           }
         }
         if (report.type === "candidate-pair" && report.state === "succeeded" && (report.nominated || report.selected)) {
@@ -1199,7 +1235,11 @@ export default function RelayRoom() {
       }
       const codecReport = codecId ? reports.get(codecId) : null;
       const codec = typeof codecReport?.mimeType === "string" ? codecReport.mimeType.replace(/^video\//i, "").toUpperCase() : null;
-      const now = performance.now(); const previous = statsPreviousRef.current.get(peerId);
+      const audioCodecReport = audioCodecId ? reports.get(audioCodecId) : null;
+      const audioCodec = typeof audioCodecReport?.mimeType === "string" ? audioCodecReport.mimeType.replace(/^audio\//i, "").toUpperCase() : null;
+      const now = performance.now();
+      const previous = statsPreviousRef.current.get(peerId);
+      const audioPrevious = audioStatsPreviousRef.current.get(peerId);
       const bitrate = previous ? Math.max(0, Math.round(((bytes - previous.bytes) * 8) / ((now - previous.at) / 1000) / 1000)) : 0;
       const emitted = previous ? jitterCount - previous.jitterCount : 0;
       const recentLost = previous ? Math.max(0, lost - previous.lost) : 0;
@@ -1212,8 +1252,17 @@ export default function RelayRoom() {
       const jitterBufferTarget = previous && emitted > 0 && jitterTargetDelay != null && previous.jitterTargetDelay != null ? Math.max(0, Math.round(((jitterTargetDelay - previous.jitterTargetDelay) / emitted) * 1000)) : null;
       const frames = previous ? decodedFrames - previous.decodedFrames : 0;
       const averageDecodeTime = previous && frames > 0 && decodeTime != null && previous.decodeTime != null ? Math.max(0, Math.round(((decodeTime - previous.decodeTime) / frames) * 1000)) : null;
+      const audioBitrate = audioPrevious ? Math.max(0, Math.round(((audioBytes - audioPrevious.bytes) * 8) / ((now - audioPrevious.at) / 1000) / 1000)) : 0;
+      const audioEmitted = audioPrevious ? audioJitterCount - audioPrevious.jitterCount : 0;
+      const recentAudioLost = audioPrevious ? Math.max(0, audioLost - audioPrevious.lost) : 0;
+      const audioJitterBuffer = audioPrevious && audioEmitted > 0 ? Math.max(0, Math.round(((audioJitterDelay - audioPrevious.jitterDelay) / audioEmitted) * 1000)) : null;
+      const audioJitterMinimum = audioPrevious && audioEmitted > 0 && audioJitterMinimumDelay != null && audioPrevious.jitterMinimumDelay != null ? Math.max(0, Math.round(((audioJitterMinimumDelay - audioPrevious.jitterMinimumDelay) / audioEmitted) * 1000)) : null;
+      const audioJitterTarget = audioPrevious && audioEmitted > 0 && audioJitterTargetDelay != null && audioPrevious.jitterTargetDelay != null ? Math.max(0, Math.round(((audioJitterTargetDelay - audioPrevious.jitterTargetDelay) / audioEmitted) * 1000)) : null;
+      const rawAvSyncOffset = audioEstimatedPlayout != null && videoEstimatedPlayout != null ? audioEstimatedPlayout - videoEstimatedPlayout : null;
+      const avSyncOffset = rawAvSyncOffset != null && Math.abs(rawAvSyncOffset) < 10_000 ? Math.round(rawAvSyncOffset) : null;
       statsPreviousRef.current.set(peerId, { bytes, at: now, jitterDelay, jitterMinimumDelay, jitterTargetDelay, jitterCount, decodeTime, decodedFrames, lost, dropped, freezes, nack, pli });
-      setQuality({ rtt, videoDelay: role === "guest" ? videoDelayRef.current : null, jitterBuffer, jitterBufferMinimum, jitterBufferTarget, decodeTime: averageDecodeTime, bitrate, fps, lost: recentLost, codec, width, height, dropped: recentDropped, freezes: recentFreezes, nack: recentNack, pli: recentPli });
+      audioStatsPreviousRef.current.set(peerId, { bytes: audioBytes, at: now, jitterDelay: audioJitterDelay, jitterMinimumDelay: audioJitterMinimumDelay, jitterTargetDelay: audioJitterTargetDelay, jitterCount: audioJitterCount, lost: audioLost });
+      setQuality({ rtt, videoDelay: role === "guest" ? videoDelayRef.current : null, jitterBuffer, jitterBufferMinimum, jitterBufferTarget, decodeTime: averageDecodeTime, bitrate, fps, lost: recentLost, codec, width, height, dropped: recentDropped, freezes: recentFreezes, nack: recentNack, pli: recentPli, audioJitterBuffer, audioJitterMinimum, audioJitterTarget, audioBitrate, audioLost: recentAudioLost, audioCodec, avSyncOffset });
     }, 2000);
     return () => window.clearInterval(timer);
   }, [role]);
@@ -1232,6 +1281,13 @@ export default function RelayRoom() {
   const controlLabel = control?.phase === "calibration" ? "校准阶段" : control?.phase === "ready" ? "校准完成" : control?.phase === "playing" ? "远程控制" : "准备阶段";
   const controlTitle = control?.phase === "setup" ? "等待房主发起校准" : control?.phase === "calibration" ? `房主正在校准 · ${control.ownerName}` : control?.phase === "ready" ? "等待启用远程控制" : "远程控制已启用";
   const controlDescription = control?.phase === "setup" ? role === "host" ? "批准操作者、连接应用控制助手并选定目标；随后由房主在成员列表中发起校准。" : "等待房主选定控制目标并发起校准。" : control?.phase === "calibration" ? role === "host" ? "目标窗口已自动置前；房主可以重新开始或取消本次校准。" : hasControl ? "房主已发起校准；Chromium 目标请依次点击两个定位点，Windows 应用会自动完成映射。" : "房主正在为其他操作者校准，本地输入暂不可用。" : control?.phase === "ready" ? role === "host" ? "点击“启用远程控制”会再次置前目标窗口，并开放远程输入。" : "校准已完成，等待房主启用远程控制。" : "获准的远端操作者可以持续使用鼠标和键盘。";
+  const resumeRemoteAudio = () => {
+    const audio = remoteAudioRef.current;
+    if (!audio) return;
+    void audio.play()
+      .then(() => setAudioPlaybackBlocked(false))
+      .catch(() => setNotice("浏览器仍阻止音频播放，请检查网站声音权限。"));
+  };
 
   return <main className="shell">
     <nav className="topbar">
@@ -1253,7 +1309,7 @@ export default function RelayRoom() {
         </div>
         <div className="audioShareOption">
           <input id="share-system-audio" type="checkbox" checked={shareAudio} onChange={(event) => setShareAudio(event.target.checked)} />
-          <label htmlFor="share-system-audio"><strong>共享系统音频</strong><small>默认关闭以减少音视频同步缓冲；需要声音时再开启</small></label>
+          <label htmlFor="share-system-audio"><strong>共享系统音频</strong><small>音频将与视频分轨播放并允许略微延后，优先保证操作画面的低延迟</small></label>
         </div>
         <div className="actions"><button className="primary" onClick={createRoom}>分享屏幕并创建房间</button></div>
         <div className="joinBox">
@@ -1269,11 +1325,11 @@ export default function RelayRoom() {
     {role && <section className="workspace">
       <div className="workspaceTitle"><div><span className="rolePill">{role === "host" ? "房主" : peerRole === "controller" ? "远端操作者" : "观众"}</span><h1>{role === "host" ? `房间 ${roomCode || "······"}` : `加入 ${roomCode || joinCode}`}</h1></div><button className="textButton" onClick={role === "host" ? closeHostedRoom : reset}>{role === "host" ? "关闭房间" : "退出房间"}</button></div>
       <div className="connectionBar"><span className={connected ? "dot online" : "dot"} />{status}<span className="secure">{connectedPeers} 个连接 · {turnStatus} · {mediaPath} · DTLS / SRTP</span></div>
-      <div className="qualityBar"><div><span>网络 RTT</span><strong>{quality.rtt == null ? "—" : `${quality.rtt} ms`}</strong></div><div className="videoDelayMetric" title="精确值依赖浏览器提供 captureTime；不支持时以接收缓冲作为可确认的延迟下限"><span>画面延迟</span><strong>{quality.videoDelay != null ? `${quality.videoDelay} ms` : quality.jitterBuffer != null ? `≥ ${quality.jitterBuffer} ms` : "—"}</strong><small>{quality.jitterBuffer == null ? "缓冲 —" : `缓冲 ${quality.jitterBuffer} · 最低 ${quality.jitterBufferMinimum ?? "—"} · 目标 ${quality.jitterBufferTarget ?? "—"} · 解码 ${quality.decodeTime ?? "—"} ms`}</small></div><div className="qualityDetailMetric"><span>视频码率</span><strong>{quality.bitrate ? `${quality.bitrate} kbps` : "—"}</strong><small>{quality.codec ?? "编解码器 —"} · {quality.width && quality.height ? `${quality.width}×${quality.height}` : "尺寸 —"}</small></div><div className="qualityDetailMetric"><span>帧率</span><strong>{quality.fps == null ? "—" : `${Math.round(quality.fps)} fps`}</strong><small>丢帧 {quality.dropped} · 冻结 {quality.freezes}</small></div><div className="qualityDetailMetric"><span>近 2 秒丢包</span><strong>{quality.lost}</strong><small>NACK {quality.nack} · PLI {quality.pli}</small></div></div>
+      <div className="qualityBar"><div><span>网络 RTT</span><strong>{quality.rtt == null ? "—" : `${quality.rtt} ms`}</strong></div><div className="videoDelayMetric" title="精确值依赖浏览器提供 captureTime；不支持时以接收缓冲作为可确认的延迟下限"><span>画面延迟</span><strong>{quality.videoDelay != null ? `${quality.videoDelay} ms` : quality.jitterBuffer != null ? `≥ ${quality.jitterBuffer} ms` : "—"}</strong><small>{quality.jitterBuffer == null ? "缓冲 —" : `缓冲 ${quality.jitterBuffer} · 最低 ${quality.jitterBufferMinimum ?? "—"} · 目标 ${quality.jitterBufferTarget ?? "—"} · 解码 ${quality.decodeTime ?? "—"} ms`}</small></div><div className="audioDelayMetric" title="音频与视频使用不同同步组；音画时差为音频 estimatedPlayoutTimestamp 减去视频值"><span>音频缓冲</span><strong>{quality.audioJitterBuffer == null ? "—" : `${quality.audioJitterBuffer} ms`}</strong><small>{quality.audioBitrate || quality.audioJitterBuffer != null ? `${quality.audioCodec ?? "音频"} · ${quality.audioBitrate || "—"} kbps · 最低 ${quality.audioJitterMinimum ?? "—"} · 目标 ${quality.audioJitterTarget ?? "—"} · ${quality.avSyncOffset == null ? "时差 —" : `音频−视频 ${quality.avSyncOffset > 0 ? "+" : ""}${quality.avSyncOffset} ms`}` : "未共享音频"}</small></div><div className="qualityDetailMetric"><span>视频码率</span><strong>{quality.bitrate ? `${quality.bitrate} kbps` : "—"}</strong><small>{quality.codec ?? "编解码器 —"} · {quality.width && quality.height ? `${quality.width}×${quality.height}` : "尺寸 —"}</small></div><div className="qualityDetailMetric"><span>帧率</span><strong>{quality.fps == null ? "—" : `${Math.round(quality.fps)} fps`}</strong><small>丢帧 {quality.dropped} · 冻结 {quality.freezes}</small></div><div className="qualityDetailMetric"><span>近 2 秒丢包</span><strong>{quality.lost}</strong><small>视频 NACK {quality.nack} · PLI {quality.pli} · 音频丢包 {quality.audioLost}</small></div></div>
       <div className="grid">
         <div>
           <div className="stage videoStage">
-            <div className="stageHeader"><span><i className={connected ? "live" : ""} /> {connected ? "实时画面" : "等待连接"}</span>{role === "guest" ? <div className="viewerTools"><button aria-label="缩小" disabled={zoom <= 1} onClick={() => setZoom((value) => Math.max(1, value - 0.25))}>−</button><b>{Math.round(zoom * 100)}%</b><button aria-label="放大" disabled={zoom >= 2.5} onClick={() => setZoom((value) => Math.min(2.5, value + 0.25))}>＋</button><button onClick={() => void toggleVideoFullscreen()}>全屏</button></div> : <div className="hostShareTools"><span>正在向 {connectedPeers} 人分享</span><button disabled={isChangingShare} onClick={changeSharedWindow}>{isChangingShare ? "等待选择…" : "更换共享窗口"}</button></div>}</div>
+            <div className="stageHeader"><span><i className={connected ? "live" : ""} /> {connected ? "实时画面" : "等待连接"}</span>{role === "guest" ? <div className="viewerTools">{audioPlaybackBlocked && <button className="audioUnlockButton" onClick={resumeRemoteAudio}>启用声音</button>}<button aria-label="缩小" disabled={zoom <= 1} onClick={() => setZoom((value) => Math.max(1, value - 0.25))}>−</button><b>{Math.round(zoom * 100)}%</b><button aria-label="放大" disabled={zoom >= 2.5} onClick={() => setZoom((value) => Math.min(2.5, value + 0.25))}>＋</button><button onClick={() => void toggleVideoFullscreen()}>全屏</button></div> : <div className="hostShareTools"><span>正在向 {connectedPeers} 人分享</span><button disabled={isChangingShare} onClick={changeSharedWindow}>{isChangingShare ? "等待选择…" : "更换共享窗口"}</button></div>}</div>
             <div className="videoViewport" ref={videoViewportRef}>
               {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex -- 这是接收完整鼠标与键盘输入的远程应用画布。 */}
               <div className={`videoWrap ${role === "guest" ? canGuestControl ? "controlActive" : "controlLocked" : ""}`} role="application" aria-label={role === "guest" ? canGuestControl ? "远程控制画面" : "只读实时画面" : "房主共享画面"} style={{ aspectRatio: videoAspect, width: role === "guest" ? `${zoom * 100}%` : "100%" }} tabIndex={canGuestControl ? 0 : -1}
@@ -1287,6 +1343,8 @@ export default function RelayRoom() {
                 {/* 屏幕共享流没有可供网页提供的字幕轨道。 */}
                 {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
                 <video ref={role === "host" ? localVideoRef : remoteVideoRef} autoPlay playsInline muted={role === "host"} onLoadedMetadata={(event) => syncVideoAspect(event.currentTarget)} onResize={(event) => syncVideoAspect(event.currentTarget)} />
+                {/* eslint-disable-next-line jsx-a11y/media-has-caption -- 远程系统音频没有独立字幕轨。 */}
+                {role === "guest" && <audio ref={remoteAudioRef} autoPlay onPlaying={() => setAudioPlaybackBlocked(false)} />}
                 {role === "host" && remotePointer.visible && <div className={`remoteCursor ${remotePointer.click ? "clicking" : ""}`} style={{ left: `${remotePointer.x * 100}%`, top: `${remotePointer.y * 100}%` }}><span>远程</span></div>}
                 {role === "guest" && !connected && <div className="videoPlaceholder"><div className="radar"><span>◎</span></div><strong>{status}</strong><small>连接建立后画面会自动出现</small></div>}
               </div>
