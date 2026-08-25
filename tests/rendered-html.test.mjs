@@ -134,10 +134,13 @@ test("本地联机组件与配置齐全", async () => {
   assert.match(companion, /pendingPointerMove/);
   assert.match(companion, /schedulePointerMove/);
   assert.match(page, /MobileJoystick/);
+  assert.match(page, /joystickDirectionThreshold\s*=\s*0\.22/);
+  assert.match(page, /threshold:\s*0\.16/);
   assert.match(page, /mobileControlsEnabledStorageKey/);
   assert.match(page, /mode === "scroll"/);
   assert.match(page, /selectstart/);
   assert.match(styles, /\.mobileJoystick/);
+  assert.match(styles, /videoViewport:fullscreen \.mobileJoystick/);
   assert.match(styles, /-moz-user-select:none!important/);
   assert.match(companion, /mouseWheel/);
   assert.match(companion, /pendingScroll/);

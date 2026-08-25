@@ -29,6 +29,7 @@ const videoProfiles: Record<VideoProfileKey, VideoProfile> = {
 
 type VirtualKey = { key: string; code: string; keyCode: number; shiftKey?: boolean };
 type RemoteTouchGesture = { pointerId: number; startX: number; startY: number; lastX: number; lastY: number; mode: "pending" | "pointer" | "scroll"; startPoint: { x: number; y: number } };
+const joystickDirectionThreshold = 0.22;
 
 function MobileJoystick({ disabled, onDirectionChange }: { disabled: boolean; onDirectionChange: (directions: string[]) => void }) {
   const zoneRef = useRef<HTMLDivElement | null>(null);
@@ -50,7 +51,7 @@ function MobileJoystick({ disabled, onDirectionChange }: { disabled: boolean; on
         mode: "static",
         position: { left: "50%", top: "50%" },
         size: 112,
-        threshold: 0.24,
+        threshold: 0.16,
         fadeTime: 0,
         restJoystick: true,
         color: { front: "rgba(255,255,255,.9)", back: "rgba(23,35,31,.76)" },
@@ -58,10 +59,10 @@ function MobileJoystick({ disabled, onDirectionChange }: { disabled: boolean; on
       manager = created;
       created.on("move", ({ data }) => {
         const directions: string[] = [];
-        if (data.vector.x <= -0.32) directions.push("{arrowleft}");
-        if (data.vector.x >= 0.32) directions.push("{arrowright}");
-        if (data.vector.y >= 0.32) directions.push("{arrowup}");
-        if (data.vector.y <= -0.32) directions.push("{arrowdown}");
+        if (data.vector.x <= -joystickDirectionThreshold) directions.push("{arrowleft}");
+        if (data.vector.x >= joystickDirectionThreshold) directions.push("{arrowright}");
+        if (data.vector.y >= joystickDirectionThreshold) directions.push("{arrowup}");
+        if (data.vector.y <= -joystickDirectionThreshold) directions.push("{arrowdown}");
         onDirectionChangeRef.current(directions);
       });
       created.on("end", () => onDirectionChangeRef.current([]));
